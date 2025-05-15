@@ -1,0 +1,65 @@
+# (Samples previously filtered with KNEADDATA)
+# De novo assembly per each sample
+run_megahit.sh
+
+# get assembly stats
+multiQC report on megahit folder (no script)
+
+# For plasmid prediction: 
+# First, identify genes with anvi'o
+anvio_annotate_genes.sh
+# Just for visualization: 
+anvio_summarise_contigs.sh
+
+# Run PlasX and get prediction for each plasmid
+run_plasx.sh
+
+# Extract contigs with PlasX prediction > 0.5 
+extract_predicted_plasmids.sh
+
+# Analyze circularity based on re-aligning each sample's reads to its plasmids and calculate number of RF pairs
+# Also calculates coverage depth and makes first plamid info file 
+analyze_circularity.sh
+
+# Then join all predicted plasmids from all samples together (no script) (and also join plasmid info and annotation files into BASE_DIR/PLASMIDS)
+(done manually)
+
+# Run ViralVerify to detect viral sequences
+run_viralverify.sh
+
+# Run pairwise alignments between all plasmids (necessary for clustering later) and use it to detect circularity, along with the ViralVerify circularity results 
+pairwise_alignment_circularity.sh
+
+# Run a blast against the PLSDB database to have extra support for being plasmids
+blast_PLSDB.sh 
+
+# Somehow check it's not a bacterial chromosome
+bacterial_chromosome_decontamination.sh 
+
+# Get the final list of plasmids 
+final_plasmid_evaluation.sh 
+# Get the actual list in the R script (saved to file  "BASE_DIR/PLASMIDS/clean_plasmid_list.txt")
+plasmid_info_description.Rmd
+
+# Extract clean list of plasmids, plasmid information, and plasmid alignments for MOBMESS
+filter_clean_plasmids.sh
+
+# With the final list of plasmids and circularity, run MobMess to cluster and deduplicate plasmids
+mobmess_cluster_plasmids.sh          # Nota: perquè funcioni mobmess, exportar l'environment de mobmess d'arnau@moniato 
+
+# visualize specific plasmid systems
+visualize_plasmid_system.sh
+
+# Profile the plasmid content of each sample
+# I do this for the whole set of plasmids altogether 47799 or for a set of only complete plasmids (excluding fragments or representative not in system)
+profile_samples.sh
+
+# Run the annotation of plasmid genes again but with a newer version of COG and Pfam (because PlasX needed older versions)
+anvio_annotate_final_plasmids.sh
+# this saves the final annotations to DATA/PLASMIDOME/ANVIO/FINAL_PLASMIDS (so ignore the ones in DATA/PLASMIDOME/PLASMIDS)
+
+# use RGI to annotate antibiotic resistance genes with CARD
+run_CARD.sh 
+
+# Then analyze in R
+plasmidome_analysis.Rmd

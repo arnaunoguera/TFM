@@ -1,0 +1,254 @@
+```{r}
+library(tidyverse)
+library(VennDiagram)
+```
+
+
+```{r}
+plasmid_info <- read.table(file = "BASE_DIR/PLASMIDS/redundant_plasmid_final_info.txt", header = T,
+                           sep = "\t") %>% mutate(bacterial_chr_presence = case_when(is.na(Bacterial_Chr) ~ FALSE, 
+                                                                                     TRUE ~ TRUE),
+                                                  PLSDB_presence = case_when(is.na(PLSDB_hit) ~ FALSE, 
+                                                                                     TRUE ~ TRUE))
+plasmid_info$ViralVerify_Score <- as.numeric(plasmid_info$ViralVerify_Score)
+colors <- c("#8EA604", "#048BA8", "#A4036F", "#F5A65B", "#0F7173", "#503D42")
+
+
+genecalls_plasmids <- read.table(file = "BASE_DIR/PLASMIDS/plasmid_related_gene_calls.txt", header = T,
+                           sep = "\t")
+cogs_pfams_plasmids <- read.table(file = "BASE_DIR/PLASMIDS/plasmid_related_cogs_and_pfams.txt", header = T,
+                           sep = "\t")
+```
+
+
+
+## General plots
+```{r}
+ggplot(data = plasmid_info, mapping = aes(x = PlasX_Score, fill = Circularity)) + geom_histogram(bins = 50) + theme_minimal() + 
+  labs(title = "PlasX score distribution") + ylab("Predicted plasmid count") + 
+  scale_fill_manual(values = viridis_pal(direction = 1)(10)[c(5,9)])
+
+ggplot(data = plasmid_info, mapping = aes(x = Length, fill = Circularity)) + geom_histogram(bins = 50) + theme_minimal() + 
+  labs(title = "Length distribution") + ylab("Predicted plasmid count") + scale_x_log10(labels = scales::comma)
+
+ggplot(data = plasmid_info, mapping = aes(x = PlasX_Score)) + 
+  geom_histogram(bins = 50, fill = viridis_pal(direction = 1)(10)[6]) + theme_minimal() +
+  labs(title = "PlasX score distribution") + ylab("Predicted plasmid count") 
+
+ggplot(data = plasmid_info, mapping = aes(x = Length)) + 
+  geom_histogram(bins = 50, fill = viridis_pal(direction = 1)(10)[8]) + theme_minimal() +
+  labs(title = "Length distribution") + ylab("Predicted plasmid count") +  scale_x_log10(labels = scales::comma)
+
+```
+
+## PlasX plots
+
+```{r}
+# Get PlasX 25% quantile value for circular plasmids
+plasx25 <- quantile(plasmid_info %>% filter(Circularity=="circular") %>% pull(PlasX_Score))["25%"]
+
+
+ggplot(data = plasmid_info, mapping = aes(x = Circularity, y = PlasX_Score, colour = Circularity)) + geom_boxplot() + 
+  scale_color_manual(values = colors[c(2,1)]) + theme_minimal() +
+  stat_summary(
+    fun.data = function(x) data.frame(y = -Inf, label = paste0("n=", length(x))),
+    geom = "text",
+    vjust = 0,
+    hjust = 0.5,
+    aes(group = Circularity)
+  ) + geom_abline(slope = 0, intercept = plasx25) + labs(title = "PlasX score by circularity") + 
+  theme(legend.position = 'none')
+
+
+# Get PlasX 25% quantile value for circular plasmids
+plasxRF25 <- quantile(plasmid_info %>% filter(Circularity_Source=="RF pairs") %>% pull(PlasX_Score))["25%"]
+
+ggplot(data = plasmid_info, mapping = aes(x = Circularity_Source, y = PlasX_Score, colour = Circularity)) + geom_boxplot() + 
+  scale_color_manual(values = colors[c(2,1)]) + theme_minimal() +
+  stat_summary(
+    fun.data = function(x) data.frame(y = -Inf, label = paste0("n=", length(x))),
+    geom = "text",
+    vjust = 0,
+    hjust = 0.5,
+    aes(group = Circularity_Source)
+  ) + labs(title = "PlasX score by circularity prediction source") + 
+  geom_abline(slope = 0, intercept = plasxRF25) +
+  theme(legend.position = 'none') 
+
+ggplot(data = plasmid_info, mapping = aes(x = ViralVerify_prediction, y = PlasX_Score, colour = ViralVerify_prediction)) + geom_boxplot() + 
+  scale_color_manual(values = colors[c(2,1,3:6)]) + theme_minimal() +
+  stat_summary(
+    fun.data = function(x) data.frame(y = -Inf, label = paste0("n=", length(x))),
+    geom = "text",
+    vjust = 0,
+    hjust = 0.5,
+    aes(group = ViralVerify_prediction)
+  ) + labs(title = "PlasX score by ViralVerify prediction") + 
+  theme(legend.position = 'none', axis.text.x = element_text(angle = -45, hjust = 0))
+
+ggplot(data = plasmid_info, mapping = aes(x = bacterial_chr_presence, y = PlasX_Score, colour = bacterial_chr_presence)) + geom_boxplot() + 
+  scale_color_manual(values = colors[1:6]) + theme_minimal() +
+  stat_summary(
+    fun.data = function(x) data.frame(y = -Inf, label = paste0("n=", length(x))),
+    geom = "text",
+    vjust = 0,
+    hjust = 0.5,
+    aes(group = bacterial_chr_presence)
+  ) + labs(title = "PlasX score by detection in bacterial chromosome database") + 
+  theme(legend.position = 'none', axis.text.x = element_text(angle = -45, hjust = 0))
+
+ggplot(data = plasmid_info, mapping = aes(x = PLSDB_presence, y = PlasX_Score, colour = PLSDB_presence)) + geom_boxplot() + 
+  scale_color_manual(values = colors[c(2,1)]) + theme_minimal() +
+  stat_summary(
+    fun.data = function(x) data.frame(y = -Inf, label = paste0("n=", length(x))),
+    geom = "text",
+    vjust = 0,
+    hjust = 0.5,
+    aes(group = PLSDB_presence)
+  ) + labs(title = "PlasX score by detection in PLSDB") + 
+  theme(legend.position = 'none', axis.text.x = element_text(angle = -45, hjust = 0))
+```
+
+## ViralVerify
+
+```{r}
+ggplot(plasmid_info, mapping = aes(x = ViralVerify_prediction, y = ViralVerify_Score, colour = ViralVerify_prediction)) + geom_boxplot() + 
+  scale_color_manual(values = colors[1:6]) + theme_minimal() +
+  stat_summary(
+    fun.data = function(x) data.frame(y = -Inf, label = paste0("n=", length(x))),
+    geom = "text",
+    vjust = 0,
+    hjust = 0.5,
+    aes(group = ViralVerify_prediction)
+  ) + labs(title = "ViralVerify predictions") + 
+  theme(legend.position = 'none', axis.text.x = element_text(angle = -45, hjust = 0)) +
+  ylim(c(-30, 100))
+
+dfvv <- plasmid_info %>% group_by(ViralVerify_prediction) %>% summarise(nvv = n()) %>% 
+  mutate(Circularity = "")
+
+ggplot(plasmid_info, mapping = aes(x = ViralVerify_prediction, fill= Circularity)) + 
+  geom_bar(position = 'fill') + 
+  scale_fill_manual(values = colors[c(2,1)]) + theme_minimal() +
+  labs(title = "Circularity by ViralVerify predictions") + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0)) +
+  geom_text(data = dfvv, aes(x = ViralVerify_prediction, y = Inf, label = nvv), 
+            vjust = 1)
+
+```
+## PLSDB and bacterial chr
+
+```{r}
+ggplot(plasmid_info, mapping = aes(x = PLSDB_cov, fill = Circularity)) +
+  geom_histogram(position = 'dodge') + theme_minimal() +
+  scale_fill_manual(values = colors[c(2,1)])
+
+ggplot(plasmid_info, mapping = aes(x = Bacterial_Chr_cov, fill = Circularity)) +
+  geom_histogram(position = 'dodge') + theme_minimal() +
+  scale_fill_manual(values = colors[c(2,1)])
+```
+
+## MOB-typer results 
+
+```{r}
+ggplot(data = plasmid_info, mapping = aes(x = predicted_mobility, y = PlasX_Score, colour = predicted_mobility)) + geom_boxplot() + 
+  scale_color_manual(values = colors[c(2,1,3:6)]) + theme_minimal() +
+  stat_summary(
+    fun.data = function(x) data.frame(y = -Inf, label = paste0("n=", length(x))),
+    geom = "text",
+    vjust = 0,
+    hjust = 0.5,
+    aes(group = predicted_mobility)
+  ) + labs(title = "PlasX score by mobility prediction") + 
+  theme(legend.position = 'none', axis.text.x = element_text(angle = -45, hjust = 0))
+
+dfmt <- plasmid_info %>% group_by(predicted_mobility) %>% summarise(nvv = n()) %>% 
+  mutate(Circularity = "")
+
+ggplot(plasmid_info, mapping = aes(x = predicted_mobility, fill= Circularity)) + 
+  geom_bar(position = 'fill') + 
+  scale_fill_manual(values = colors[c(2,1)]) + theme_minimal() +
+  labs(title = "Circularity by ViralVerify predictions") + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0)) +
+  geom_text(data = dfmt, aes(x = predicted_mobility, y = Inf, label = nvv), 
+            vjust = 1)
+```
+
+
+
+## Overlap comparisons
+
+```{r}
+plot_venn <- function(vennlist, names, colors){
+  grid.newpage()
+  venn_object <- venn.diagram(x = vennlist, filename = NULL, disable.logging = T, 
+               category.names = names,
+               lwd = 2,
+               lty = 'blank',
+               fill = colors)
+  grid.draw(venn_object)
+}
+
+
+PLSDB_hits <- plasmid_info %>% filter(!is.na(PLSDB_hit)) %>% pull(Plasmid_ID)
+bacterial_hits <- plasmid_info %>% filter(!is.na(Bacterial_Chr)) %>% pull(Plasmid_ID)
+circular_plasmids <- plasmid_info %>% filter(Circularity == "circular") %>% pull(Plasmid_ID)
+virus <- plasmid_info %>% filter(ViralVerify_prediction == "Virus") %>% pull(Plasmid_ID)
+highPlasX <- plasmid_info %>% filter(PlasX_Score >= plasxRF25) %>% pull(Plasmid_ID)
+mobtyper <- plasmid_info %>% filter(predicted_mobility != "non-mobilizable") %>% pull(Plasmid_ID)
+genecalls <- genecalls_plasmids$contig %>% unique()
+
+unkown_plasmids <- plasmid_info$Plasmid_ID[!plasmid_info$Plasmid_ID %in% PLSDB_hits & !plasmid_info$Plasmid_ID %in% bacterial_hits &
+                                             !plasmid_info$Plasmid_ID %in% circular_plasmids & !plasmid_info$Plasmid_ID %in% virus &
+                                             !plasmid_info$Plasmid_ID %in% highPlasX & !plasmid_info$Plasmid_ID %in% mobtyper &
+                                             !plasmid_info$Plasmid_ID %in% genecalls]
+
+
+plot_venn(list(highPlasX, circular_plasmids, PLSDB_hits, bacterial_hits, virus),
+          c("PlasX", "Circular", "PLSDB", "Bacterial", "Virus"), c("#aaea60", "#77ecd3", "#5af18c", "#e47347", "#bd71f8"))
+
+plot_venn(list(unique(c(highPlasX, circular_plasmids)),PLSDB_hits, bacterial_hits, virus),
+          c("Plasmid", "PLSDB", "Bacterial", "Virus"), c("#aaea60", "#5af18c", "#e47347", "#bd71f8"))
+
+plot_venn(list(highPlasX, circular_plasmids, PLSDB_hits, mobtyper, genecalls),
+          c("PlasX", "Circular", "PLSDB", "Mobilizable", "Gene calls"), c("#aaea60", "#5af18c", "#e47347", "#bd71f8", "#77ecd3"))
+
+plot_venn(list(highPlasX, circular_plasmids, PLSDB_hits, mobtyper, genecalls),
+          c("PlasX", "Circular", "PLSDB", "mobtyper", "Gene calls"), c(c("#aaea60", "#77ecd3", "#5af18c", "limegreen", "#bd71f8")))
+
+plot_venn(list(unique(c(highPlasX, circular_plasmids, mobtyper, genecalls)),PLSDB_hits, bacterial_hits, virus),
+          c("Predicted plasmid", "PLSDB", "Bacterial", "Virus"), c("#aaea60", "#5af18c", "#e47347", "#bd71f8"))
+```
+
+# Final plasmid evaluation 
+
+```{r}
+plasmid_info <- plasmid_info %>% mutate(Plasmid_evidence = case_when(PLSDB_presence == TRUE ~ "PLSDB",
+                                                                  bacterial_chr_presence == TRUE ~ "chromosome",
+                                                                  predicted_mobility != "non-mobilizable" ~ "mob-suite",
+                                                                  ViralVerify_prediction == "Virus" ~ "virus", 
+                                                                  Circularity == "circular" ~ "circular",
+                                                                  PlasX_Score >= plasxRF25 ~ "High_PlasX",
+                                                                  Plasmid_ID %in% genecalls_plasmids$contig ~ "gene_calls",
+                                                                  TRUE ~ "unknown"), 
+                                        prediction = case_when(Plasmid_evidence %in% c("PLSDB", "mob-suite","circular", 
+                                                                                       "High_PlasX", "gene_calls") ~ "Plasmid",
+                                                               Plasmid_evidence %in% c("virus", "chromosome") ~ "Non-plasmid",
+                                                               Plasmid_evidence == "unknown" ~ "unknown"))
+
+plasmid_info$Plasmid_evidence %>% table()
+plasmid_info$prediction %>% table()
+
+clean_plasmids <- plasmid_info %>% filter(prediction == "Plasmid") %>% pull(Plasmid_ID)
+write(x = clean_plasmids, file = "BASE_DIR/PLASMIDS/clean_plasmid_list.txt", ncolumns = 1)
+non_plasmids <- plasmid_info %>% filter(prediction != "Plasmid") %>% pull(Plasmid_ID)
+write(x = non_plasmids, file = "BASE_DIR/PLASMIDS/non_plasmid_list.txt", ncolumns = 1)
+
+ggplot(data = plasmid_info, mapping = aes(x = PlasX_Score, fill = prediction)) + geom_density(alpha = 0.5)  + theme_minimal() + 
+  labs(title = "PlasX score distribution") 
+
+ggplot(data = plasmid_info, mapping = aes(x = Length, fill = prediction)) + geom_density(alpha = 0.5)  + theme_minimal() + 
+  labs(title = "Length distribution")  + scale_x_log10(labels = scales::comma)
+
+```
+
