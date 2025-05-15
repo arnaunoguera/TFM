@@ -139,7 +139,7 @@ do
         --no-unal > "$results_dir/${sample}/${sample}.log"  2>&1
 
         # Clear swap
-        echo 'metalab00' | sudo -S swapoff -a; sudo -S swapon -a
+        echo 'password' | sudo -S swapoff -a; sudo -S swapon -a
 
         # Remove the sorted reads
         rm "$reads_dir/${sample}_kneaddata_paired_1-sorted.fastq" "$reads_dir/${sample}_kneaddata_paired_2-sorted.fastq"
