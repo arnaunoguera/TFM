@@ -101,6 +101,6 @@ do
     --overwrite
 
   # Clear swap
-  echo 'metalab00' | sudo -S swapoff -a; sudo -S swapon -a
+  echo 'password' | sudo -S swapoff -a; sudo -S swapon -a
 
 done

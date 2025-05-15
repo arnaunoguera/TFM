@@ -208,7 +208,7 @@ if [ "$step" == "1" ] || [ "$step" == "all" ]; then
     rm "$input_dir/${sample}_kneaddata_paired_1-sorted.fastq" "$input_dir/${sample}_kneaddata_paired_2-sorted.fastq"
 
     # Clear swap
-    echo 'metalab00' | sudo -S swapoff -a; sudo -S swapon -a 
+    echo 'password' | sudo -S swapoff -a; sudo -S swapon -a 
   done
 fi
 
