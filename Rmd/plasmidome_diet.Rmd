@@ -1,0 +1,568 @@
+# Libraries
+```{r}
+library(plyr)
+library(tidyverse)
+library(pheatmap)
+library(ggplot2)
+library(ape)
+library(ComplexHeatmap)
+library(circlize)
+library(edgeR)
+library(readxl)
+library(umap)
+library(ecodist)
+library(rnndescent)
+library(uwot)
+library(phyloseq)
+library(scales)
+library(randomcoloR)
+library(magrittr)
+library(cowplot)
+library(gridExtra)
+library(viridis)
+library(ANCOMBC)
+library(MicrobiomeProfiler)
+library(ggrepel)
+library(e1071)
+source("BASE_DIR/SCRIPTS/omics_analyses_functions.R")
+source("BASE_DIR/SCRIPTS/PLASMIDOME/plasmidome_analysis_functions.R")
+source("BASE_DIR/SCRIPTS/diversity.R")
+```
+
+```{r}
+# Color palettes
+colors <- list(disease = c("Healthy" = "#7AD151FF", "UC" = "#FDE725FF", "CD" = "#414487FF"), 
+               project = c("POP" = "#46F884FF", "IBD Validation" = "#F05B12FF", "Longitudinal Mycobiome" = "#3E9BFEFF"),
+               gender = c("m" = "#395D9CFF", "f" = "#60CEACFF"), 
+               circularity = c("#FCA50AFF", "#932667FF"), 
+               only_complete = c("all" = "#FFEA46FF", "only_complete" = "#31446BFF"), 
+               general_palette_other = c(viridis_pal(option = "H", begin = 0.3, end = 0.1, direction = 1)(3), 
+                                         viridis_pal(direction = 1)(10), viridis_pal(option = "C", direction = -1)(10), 
+                                         viridis_pal(option = "H", begin = 1, end = 0.77)(3), "#BEBEBE" ),
+               general_palette = c(viridis_pal(option = "H", begin = 0.3, end = 0.1, direction = 1)(3), 
+                                   viridis_pal(direction = 1)(10), viridis_pal(option = "C", direction = -1)(10), 
+                                   viridis_pal(option = "H", begin = 1, end = 0.77)(3)),
+               sensitivity = c("passed" = "black", "failed" = "#606060", "struc_zero" = "red"))
+
+show_col(colors$general_palette)
+```
+
+
+
+# Read input files
+## Metadata
+
+Process POP metadata 
+```{r}
+sample_list <- read.table(file = 'BASE_DIR/SAMPLE_LISTS/AllSamples.txt', header = F, sep = '\t', 
+                          col.names = c("SubjectID", "Study"), colClasses = c("character", "factor")) %>% 
+  mutate(Study = case_when(Study == "POP" ~ "POP", Study == "LONGITUDINAL_MYCOBIOME" ~ "Longitudinal Mycobiome",
+                           Study == "LUISITO_IBD" ~ "IBD Validation"))
+
+metadata <- read.table(file = 'BASE_DIR/WEB_FILES/Integred_met_aug24.tsv', sep = '\t', header = T)
+colnames(metadata) <- gsub("\\.", "_", colnames(metadata))
+diversity <- read.table(file = '/mnt/synology/DATA_ANALYSIS/POP_STUDY/alpha_div_bact.csv', sep = ',', header = T) %>%
+  rename(Novogene_ID = ID, bacterial_Chao1 = Chao1, bacterial_Shannon = Shannon)
+
+
+metadata$ID <- gsub(pattern = 'Hc_D', replacement = 'HC_D', x = metadata$ID, ignore.case = F, fixed = T)
+metadata$Code <- gsub(pattern = 'Hc_D', replacement = 'HC_D', x = metadata$Code, ignore.case = F, fixed = T)
+
+## Change first sample for individual who changed gender between questionnaires
+metadata[metadata$ID == 'HC_D1046_0', 'Gender'] <- 'other'
+
+# Group by each ID and calculate mean values (only relevant variables)
+# all genders must be the same for a single individual
+selected_metadata <- metadata %>% rename(n_Survey = n_Survey_y, hPDI_Adj = hDPI_Adj, uPDI_Adj = uDPI_Adj)
+
+integrated_metadata <- left_join(selected_metadata, diversity %>% select(bacterial_Chao1, bacterial_Shannon, Novogene_ID), by = 'Novogene_ID')
+
+############################## MOMENTARY FIX FOR SOME PDI indexes that were calculated wrong in 2nd timepoint
+PDI_fix <- read.table(file = 'BASE_DIR/WEB_FILES/dpi_adj_TP2_aug24.csv', sep = '\t', header = T)
+PDI_fix$RN_ID <- gsub(pattern = 'Hc_D', replacement = 'HC_D', x = PDI_fix$RN_ID, ignore.case = F, fixed = T)
+
+integrated_metadata[match(PDI_fix$RN_ID, integrated_metadata$ID), 'hPDI_Adj'] <- PDI_fix$hDPI
+integrated_metadata[match(PDI_fix$RN_ID, integrated_metadata$ID), 'uPDI_Adj'] <- PDI_fix$uDPI
+
+joint_metadata <- integrated_metadata %>% filter(Novogene_ID %in% sample_list$SubjectID) %>% 
+  rename(SubjectID = Novogene_ID) %>% mutate(Disease = 'Healthy', Study = 'POP') %>% 
+  rename(BMI_value = BMI) %>%
+  mutate(BMI = case_when(BMI_value < 18.5 ~ 'underweight', BMI_value < 25 ~ 'healthy weight',
+                         BMI_value < 30 ~ 'overweight', BMI_value >= 30 ~ 'obesity'))
+rownames(joint_metadata) <- joint_metadata$SubjectID
+
+MET <- sample_data(joint_metadata)
+
+```
+
+
+# Load phyloseq
+```{r}
+load(file = "BASE_DIR/PROFILING/phyloseq_complete.RData")
+
+eliminate_samples <- phylist_plasmids[["phy_count"]]@sam_data$SubjectID[!phylist_plasmids[["phy_count"]]@sam_data$SubjectID %in% joint_metadata$SubjectID]
+#Filter out samples from that are not in POP
+
+# Filter out plasmids with not enough prevalence
+filt_plasmids <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_count"]]@otu_table), abundance = 0.001,
+                                                               prevalence = 0.5)[[2]]
+filt_systems <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_systems_rpkm"]]@otu_table), abundance = 0.001,
+                                                               prevalence = 0.1)[[2]]
+filt_COG <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_rpkm_COG20"]]@otu_table), abundance = 0.001,
+                                                               prevalence = 0.1)[[2]]
+filt_pfam <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_rpkm_pfam"]]@otu_table), abundance = 0.001,
+                                                               prevalence = 0.1)[[2]]
+
+
+phylist_plasmids[["phy_count"]] <- phylist_plasmids[["phy_count"]] %>% subset_samples(!SubjectID %in% eliminate_samples) %>% 
+  subset_taxa(!Plasmid_ID %in% filt_plasmids)
+phylist_plasmids[["phy_rpkm"]] <- phylist_plasmids[["phy_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples) %>% 
+  subset_taxa(!Plasmid_ID %in% filt_plasmids)
+phylist_plasmids[["phy_logrpkm"]] <- phylist_plasmids[["phy_logrpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples) %>% 
+  subset_taxa(!Plasmid_ID %in% filt_plasmids)
+# phylist_plasmids[["phy_system_rpkm"]] <- phylist_plasmids[["phy_system_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+phylist_plasmids[["phy_systems_rpkm"]] <- phylist_plasmids[["phy_systems_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples) %>% 
+  subset_taxa(!systems %in% filt_systems)
+# phylist_plasmids[["phy_rep_rpkm"]] <- phylist_plasmids[["phy_rep_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+# phylist_plasmids[["phy_relaxase_rpkm"]] <- phylist_plasmids[["phy_relaxase_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+# phylist_plasmids[["phy_mpf_rpkm"]] <- phylist_plasmids[["phy_mpf_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+# phylist_plasmids[["phy_orit_rpkm"]] <- phylist_plasmids[["phy_orit_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+# phylist_plasmids[["phy_mobility_rpkm"]] <- phylist_plasmids[["phy_mobility_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+# phylist_plasmids[["phy_cluster_type_rpkm"]] <- phylist_plasmids[["phy_cluster_type_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+# phylist_plasmids[["phy_circularity_rpkm"]] <- phylist_plasmids[["phy_circularity_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+phylist_plasmids[["phy_AMR"]] <- phylist_plasmids[["phy_AMR"]] %>% subset_samples(!SubjectID %in% eliminate_samples)
+phylist_plasmids[["phy_rpkm_COG20"]] <- phylist_plasmids[["phy_rpkm_COG20"]] %>% subset_samples(!SubjectID %in% eliminate_samples) %>% 
+  subset_taxa(!accession %in% filt_COG)
+phylist_plasmids[["phy_rpkm_pfam"]] <- phylist_plasmids[["phy_rpkm_pfam"]] %>% subset_samples(!SubjectID %in% eliminate_samples) %>% 
+  subset_taxa(!accession %in% filt_pfam)
+
+
+# Recalculate distance matrices with Bray-Curtis
+phylist_plasmids[["dist"]] <- bcdist(as.matrix(data.frame(otu_table(phylist_plasmids[["phy_rpkm"]]))) %>% t())
+phylist_plasmids[["dist_tree"]] <- hclust(phylist_plasmids[["dist"]], method = "complete")
+
+
+#  Add the pop diet metadata (MET) along with the sample data we already have
+phylist_plasmids[["phy_count"]] <- merge_phyloseq(phylist_plasmids[["phy_count"]], MET)
+phylist_plasmids[["phy_rpkm"]] <- merge_phyloseq(phylist_plasmids[["phy_rpkm"]], MET)
+phylist_plasmids[["phy_logrpkm"]] <- merge_phyloseq(phylist_plasmids[["phy_logrpkm"]], MET)
+phylist_plasmids[["phy_AMR"]] <- merge_phyloseq(phylist_plasmids[["phy_AMR"]], MET)
+phylist_plasmids[["phy_systems_rpkm"]] <- merge_phyloseq(phylist_plasmids[["phy_systems_rpkm"]], MET)
+phylist_plasmids[["phy_rpkm_COG20"]] <- merge_phyloseq(phylist_plasmids[["phy_rpkm_COG20"]], MET)
+phylist_plasmids[["phy_rpkm_pfam"]] <- merge_phyloseq(phylist_plasmids[["phy_rpkm_pfam"]], MET)
+
+save(phylist_plasmids,
+     file = "BASE_DIR/phyloseq_POP.RData")
+
+
+```
+
+
+
+## Load phyloseq
+```{r}
+load(file = "BASE_DIR/phyloseq_POP.RData")
+
+colors <- list(disease = c("Healthy" = "#7AD151FF", "UC" = "#FDE725FF", "CD" = "#414487FF"), 
+               project = c("POP" = "#46F884FF", "IBD Validation" = "#F05B12FF", "Longitudinal Mycobiome" = "#3E9BFEFF"),
+               gender = c("m" = "#395D9CFF", "f" = "#60CEACFF"), 
+               circularity = c("#FCA50AFF", "#932667FF"), 
+               only_complete = c("all" = "#FFEA46FF", "only_complete" = "#31446BFF"), 
+               general_palette_other = c(viridis_pal(option = "H", begin = 0.3, end = 0.1, direction = 1)(3), 
+                                         viridis_pal(direction = 1)(10), viridis_pal(option = "C", direction = -1)(10), 
+                                         viridis_pal(option = "H", begin = 1, end = 0.77)(3), "#BEBEBE" ),
+               general_palette = c(viridis_pal(option = "H", begin = 0.3, end = 0.1, direction = 1)(3), 
+                                   viridis_pal(direction = 1)(10), viridis_pal(option = "C", direction = -1)(10), 
+                                   viridis_pal(option = "H", begin = 1, end = 0.77)(3)),
+               sensitivity = c("passed" = "black", "failed" = "#606060", "struc_zero" = "red"))
+```
+
+
+
+# Exploratory plots
+
+## Samples
+```{r}
+
+# boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Gender", vary = "n_reads", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Gender", vary = "Weight", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Gender", vary = "Height", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Gender", vary = "Age", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Gender", vary = "BMI_value", palette = viridis(n = 3))
+
+
+ggplot(data.frame(sample_data(phylist_plasmids$phy_count)), 
+       mapping = aes(x = Gender, fill = factor(BMI, levels = c("obesity", "overweight", "healthy weight", "underweight")))) +
+  geom_bar(position = "fill") + theme_minimal() +
+  scale_fill_viridis(discrete = T, name = "BMI")
+
+ggplot(data.frame(sample_data(phylist_plasmids$phy_count)), 
+       mapping = aes(x = Study, fill = Gender)) +
+  geom_bar(position = "fill") + theme_minimal() + 
+  scale_fill_manual(values = colors[["gender"]])
+
+
+```
+
+# Relative abundance
+
+```{r}
+# At the plasmid level: 
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_rpkm"]], facet_condition = "Gender", top_func = sum,
+                     taxonomic_rank = "Plasmid_ID", plotlegend = T, n = 20, tax_glom_done = T, palette = colors$general_palette_other) + 
+  guides(fill = guide_legend(ncol = 1)) 
+
+# At the plasmid system level:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_system_rpkm"]], facet_condition = "Gender", top_func = sum, drop_none = F,
+                     taxonomic_rank = "system", plotlegend = T, n = 20, tax_glom_done = T, 
+                     legend_label = "Plasmid system", palette = colors$general_palette_other)  + 
+  guides(fill = guide_legend(ncol = 1)) 
+
+# At the plasmid systems level:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_systems_rpkm"]], facet_condition = "Gender", top_func = sum, drop_none = F,
+                     taxonomic_rank = "systems", plotlegend = T, n = 40, tax_glom_done = T, 
+                     legend_label = "Plasmid systems", palette = colors$general_palette_other)  + 
+  guides(fill = guide_legend(ncol = 1)) 
+
+
+# AMR
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_AMR"]], facet_condition = "Gender", top_func = sum,
+                         taxonomic_rank = "ARG", plotlegend = T, tax_glom_done = T, 
+                         legend_label = "AMR", palette = colors$general_palette)  +
+  guides(fill = guide_legend(ncol = 1))  + coord_cartesian(ylim = c(0, 0.05))
+
+
+```
+
+# AMR
+
+```{r}
+resistance_rpkm <- (otu_table(phylist_plasmids[["phy_AMR"]]) %>% data.frame() %>% as.matrix())["TRUE",]
+
+phylist_plasmids[["phy_rpkm"]]@sam_data$resistance_rpkm <- resistance_rpkm[rownames(phylist_plasmids[["phy_rpkm"]]@sam_data)]
+
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Gender", vary = "resistance_rpkm", palette = viridis(n = 3))
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Region_Areas", vary = "resistance_rpkm", palette = viridis(n = 4))
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Diet_Grouped", vary = "resistance_rpkm")#, palette = viridis(n = 3))
+```
+
+# PcoA
+```{r}
+
+pcoa_results <- pcoa(phylist_plasmids[["dist"]])
+pcoa_table <- cbind(sample_data(phylist_plasmids$phy_count),
+                    as.data.frame(pcoa_results$vectors)[rownames(sample_data(phylist_plasmids$phy_count)),])
+phylist_plasmids[["pcoa_table"]] <- pcoa_table
+phylist_plasmids[["pcoa_results"]] <- pcoa_results
+
+pcoa_results_oc <- pcoa(phylist_plasmids_only_complete[["dist"]])
+pcoa_table_oc <- cbind(sample_data(phylist_plasmids_only_complete$phy_count),
+                    as.data.frame(pcoa_results_oc$vectors)[rownames(sample_data(phylist_plasmids_only_complete$phy_count)),])
+phylist_plasmids_only_complete[["pcoa_table"]] <- pcoa_table_oc
+phylist_plasmids_only_complete[["pcoa_results"]] <- pcoa_results_oc
+
+```
+
+Plots
+```{r}
+
+plot_pcoa(pcoa_table = phylist_plasmids[["pcoa_table"]], pcoa_results = phylist_plasmids[["pcoa_results"]], colorvar = "Gender", 
+          shapevar = "Study", palette = colors[["gender"]], ellipse = T)
+
+plot_pcoa(pcoa_table = phylist_plasmids_only_complete[["pcoa_table"]], pcoa_results = phylist_plasmids_only_complete[["pcoa_results"]], 
+          colorvar = "Gender", shapevar = "Study", palette = colors[["gender"]], ellipse = T)
+
+
+# Scree plots: 
+scree_plot(phylist_plasmids[["pcoa_results"]], num = 20, color = colors[["only_complete"]]["all"])
+scree_plot(phylist_plasmids_only_complete[["pcoa_results"]], num = 20, color = colors[["only_complete"]]["only_complete"])
+
+```
+
+# Alpha diversity
+
+## Chao1
+```{r}
+chao1_results <- chao1_from_physeq_abs(phy_obj = phylist_plasmids[["phy_count"]], variable = "Gender", palette = colors[["gender"]])
+
+chao1_results$plot
+
+# chao1_results_oc <- chao1_from_physeq_abs(phy_obj = phylist_plasmids_only_complete[["phy_count"]], variable = "Gender", palette = colors[["gender"]])
+# 
+# chao1_results_oc$plot
+
+```
+
+## Shannon
+
+```{r}
+shannon_results <- shannon_from_physeq(phy_obj = phylist_plasmids[["phy_rpkm"]], variable = "Gender", palette = colors[["gender"]])
+
+shannon_results$plot
+
+# shannon_results_oc <- shannon_from_physeq(phy_obj = phylist_plasmids_only_complete[["phy_rpkm"]], 
+#                                           variable = "Gender", palette = colors[["gender"]])
+# 
+# shannon_results_oc$plot
+
+
+```
+
+## Add measures to data
+
+```{r}
+phylist_plasmids[["phy_rpkm"]]@sam_data$Rel_Chao1 <- phylist_plasmids[["phy_rpkm"]]@sam_data$Chao1_plasmids / 
+                                                        phylist_plasmids[["phy_rpkm"]]@sam_data$Chao1_bact
+
+phylist_plasmids[["phy_rpkm"]]@sam_data$Rel_Shannon <- phylist_plasmids[["phy_rpkm"]]@sam_data$Shannon_plasmids -
+                                                        phylist_plasmids[["phy_rpkm"]]@sam_data$Shannon_bact
+
+
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Region_Areas", vary = "Rel_Shannon")
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Region_Areas", vary = "Rel_Chao1")
+
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Region_Areas", vary = "Chao1_plasmids")
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Region_Areas", vary = "Shannon_plasmids")
+
+
+
+```
+
+
+
+# Beta diversity 
+
+```{r}
+beta_div <- plot_beta_div(physeq = phylist_plasmids$phy_rpkm, dist = phylist_plasmids$dist, group = "Gender", 
+                          pairwise_adonis = T, add_pval = T)
+
+# beta_div_oc <- plot_beta_div(physeq = phylist_plasmids_only_complete$phy_rpkm, dist = phylist_plasmids_only_complete$dist, group = "Gender",
+#               pairwise_adonis = T, add_pval = T) 
+
+beta_div$plot
+# beta_div_oc$plot
+```
+
+
+# Variable names 
+```{r}
+interest_variables <- data.frame(diet_variables = c("Item1", "Item2", "Item3", "Item4", "Item5", 
+                                                                        "Item6", "Item7", "Item8", "Item9", "Item10", "Item11", "Item12", 
+                                                                        "Item13", "Item14", "Item15", "Item16", "Item17", "Item18", "Item19", 
+                                                                        "Item20", "Item21", "Item22", "Item23", "Item24", "Item25", "Item26", 
+                                                                        "Item27", "Item28", "Item29", "Item30", "Item31", "Item32", "Item33", 
+                                                                        "Item34", "Item35", "Item36", "Item37", "Item38", "Item39", "Item40", 
+                                                                        "Item41", "Item42", "Item43", "Item44", "Item45", "Item46", "Item47", 
+                                                                        "Item48", "Item49", "Item50", "Item51", "Item52", "Item53", "Item54", 
+                                                                        "Item55", "Item56", "Item57", "Item58",
+                                                                        "Energy_kcal", "Total_Fat_g", "Total_Protein_g", 
+                                                                "Water_g", "Fibre_g", "CHO_g", "MUFA_g", "PUFA_g", "SFA_g", "Cholesterol_mg", 
+                                                                "VitA_ret_eq_mcg", "VitD_mcg", "VitE_alpha_tocoferol_mg", "Biotin_mcg", 
+                                                                "Total_Folate_mcg", "Total_Niacin_eq_mg", "VitB5_mg", "Riboflavin_mg", 
+                                                                "Tiamin_mg", "VitB12_mcg", "VitB6_mg", "VitC_mg", "Calcium_mg", 
+                                                                "Iron_mg", "Potassium_mg", "Magnesium_mg", "Sodium_mg", "Phosphorus_mg", 
+                                                                "Iodur_mcg", "Selenium_mcg", "Zinc_mg", "Alcohol_g", "Sugar_g", 
+                                                                "HEI_2015", "PDI_Adj", "hPDI_Adj", 
+                                                                "uPDI_Adj", "aMED", "IASE",
+                                                                "Alcoholic_beverage", 
+                                                                "Appetizers", "Biscuits_and_Breakfast_Cereals", "Chocolates_and_Derivatives", 
+                                                                "Fats_and_Oils", "Fish_and_Shellfish", "Fruits_and_Fruit_Products", 
+                                                                "Legumes", "Meat_and_Eggs", "Milk_and_Dairy", "Non_Alcoholic_Drinks", 
+                                                                "Nuts_and_Seeds", "Pastries_and_Sweet_Breads", "Potatoes_and_Other_Tubercules", 
+                                                                "Ready_To_Eat_Meals", "Sauces_and_Condiments", "Sausages_and_Other_Meat_Products", 
+                                                                "Sugar_and_Other_Sweets", "Vegetables", "White_Bread", "White_Grains", 
+                                                                "Whole_Bread", "Whole_Grains", "Yogurth"))
+interest_variables$names <- gsub(pattern = "_", replacement = " ", x = interest_variables$diet_variables, fixed = T)
+rownames(interest_variables) <- interest_variables$diet_variables
+interest_variables["Sausages_and_Other_Meat_Products","names"] <- "Other Meat Products" 
+interest_variables["Pastries_and_Sweet_Breads","names"] <- "Pastries" 
+interest_variables["Fruits_and_Fruit_Products","names"] <- "Fruits"
+interest_variables["Sugar_and_Other_Sweets","names"] <- "Sugar and Sweets"
+```
+
+
+# Diet correlations 
+
+```{r}
+# compare plasmids related with IBD with plasmids correlated with diet
+IBD_PLASMIDS <- read.table(file = "BASE_DIR/PLASMIDOME_results/Plasmids_ancomBC.tsv", header = T) %>% 
+  mutate(Abundance = ifelse(lfc > 0, "+", "-")) %>% mutate(label = paste0(Disease, Abundance)) %>% select(Plasmid_ID, label)
+
+
+corr_plasmid_diet <- corrplot_from_physeq_complexHeatmap_arnau(phy_obj = phylist_plasmids[["phy_rpkm"]], corrmethod = "spearman", 
+                                                   interest_metadata = interest_variables$diet_variables, 
+                                                   AncomBC_results = IBD_PLASMIDS, row_fontsize = 0, colnames_table = interest_variables,
+                                                   col_fun = colorRamp2(c(-0.3, 0, 0.3), c("#0D0887FF", "white", "darkgoldenrod2")), 
+                                                   row_label = "plasmids", cols_label = "dietary variables", n_cols = T, n_rows = T)
+
+corr_plasmid_diet$plot
+
+corr_plasmid_diet$ANCOMBC_match %>% filter(!is.na(Abundance)) %>% nrow()
+corr_plasmid_diet$ANCOMBC_match %>% nrow()
+  
+write.table(x = corr_plasmid_diet$table %>% filter(!is.na(r_if_sig)) %>% select(-r_if_sig) %>% 
+            arrange(desc(R)), 
+          file = "BASE_DIR/PLASMIDOME_results/plasmid_diet_corr.tsv", sep = "\t", row.names = F)
+
+```
+
+
+
+
+## Alpha diversity 
+```{r}
+phylist_plasmids[["phy_rpkm"]]@sam_data$Relative_Chao1 <- phylist_plasmids[["phy_rpkm"]]@sam_data$Chao1_plasmids /   
+                                                                phylist_plasmids[["phy_rpkm"]]@sam_data$Chao1_bact 
+phylist_plasmids[["phy_rpkm"]]@sam_data$Relative_Shannon <- phylist_plasmids[["phy_rpkm"]]@sam_data$Shannon_plasmids -   
+                                                                phylist_plasmids[["phy_rpkm"]]@sam_data$Shannon_bact 
+
+phylist_plasmids[["phy_rpkm"]]@sam_data$Plasmid_Shannon <- phylist_plasmids[["phy_rpkm"]]@sam_data$Shannon_plasmids
+phylist_plasmids[["phy_rpkm"]]@sam_data$Plasmid_Chao1 <- phylist_plasmids[["phy_rpkm"]]@sam_data$Chao1_plasmids
+phylist_plasmids[["phy_rpkm"]]@sam_data$Bacterial_Shannon <- phylist_plasmids[["phy_rpkm"]]@sam_data$Shannon_bact
+phylist_plasmids[["phy_rpkm"]]@sam_data$Bacterial_Chao1 <- phylist_plasmids[["phy_rpkm"]]@sam_data$Chao1_bact
+
+plasmid_alpha_corr <- corrplot_from_physeq_metadata_complexHeatmap_arnau(phy_obj = phylist_plasmids[["phy_rpkm"]], corrmethod = "spearman", 
+                                             interest_metadata1 = c("Plasmid_Shannon", "Plasmid_Chao1"),
+                                             interest_metadata2 = interest_variables$diet_variables,
+                                             col_fun = colorRamp2(c(-0.3, 0, 0.3), c("#0D0887FF", "white", "darkgoldenrod2")),
+                                            colnames_table = interest_variables)
+plasmid_alpha_corr
+
+all_alpha_corr <- corrplot_from_physeq_metadata_complexHeatmap_arnau(phy_obj = phylist_plasmids[["phy_rpkm"]], corrmethod = "spearman", 
+                                             interest_metadata1 = c("Plasmid_Shannon", "Plasmid_Chao1",
+                                                                    "Bacterial_Shannon", "Bacterial_Chao1",
+                                                                    "Relative_Shannon", "Relative_Chao1"),
+                                             col_fun = colorRamp2(c(-0.3, 0, 0.3), c("#0D0887FF", "white", "darkgoldenrod2")),
+                                             interest_metadata2 = interest_variables$diet_variables,
+                                             keep1 = c("Relative_Shannon", "Relative_Chao1"), colnames_table = interest_variables)
+all_alpha_corr
+```
+
+```{r}
+correlation_from_physeq(phy_obj = phylist_plasmids[["phy_rpkm"]], var1 = "Shannon_plasmids", var2 = "Shannon_bact")
+
+phylist_plasmids[["phy_rpkm"]]@sam_data %>% data.frame() %>% pivot_longer(cols = c("Shannon_rel", "Shannon_bact", "Shannon_plasmids"), names_to = "Shannon",values_to = "value") %>% ggplot(aes(x= Shannon, y = value, color = Shannon))  + geom_boxplot()
+```
+
+
+
+## Gene level
+
+```{r}
+
+# compare plasmids related with IBD with plasmids correlated with diet
+IBD_genes <- read.table(file = "BASE_DIR/PLASMIDOME_results/COG_ancomBC.tsv", header = T, sep = '\t', quote = "") %>% 
+  mutate(Abundance = ifelse(lfc > 0, "+", "-")) %>% mutate(label = paste0(Disease, Abundance)) %>% rename(Plasmid_ID = accession) %>% 
+  select(Plasmid_ID, label) %>% group_by(Plasmid_ID) %>% summarise(label = paste0(label, collapse = ","))
+
+
+
+corr_genes_diet <- corrplot_from_physeq_complexHeatmap_arnau(phy_obj = phylist_plasmids[["phy_rpkm_COG20"]], corrmethod = "spearman", 
+                                                   interest_metadata = interest_variables$diet_variables, 
+                                                   AncomBC_results = IBD_genes, row_fontsize = 0, colnames_table = interest_variables,
+                                                   col_fun = colorRamp2(c(-0.3, 0, 0.3), c("#0D0887FF", "white", "darkgoldenrod2")), 
+                                                   row_label = "COGs", cols_label = "dietary variables", n_cols = T, n_rows = T)
+
+corr_genes_diet$plot
+
+corr_genes_diet$ANCOMBC_match %>% nrow()
+corr_genes_diet$ANCOMBC_match %>% filter(!is.na(Abundance)) %>% nrow()
+
+
+write.table(x = corr_genes_diet$table %>% filter(!is.na(r_if_sig)) %>% select(-r_if_sig) %>% 
+              left_join(phylist_plasmids[["phy_rpkm_COG20"]]@tax_table %>% data.frame() %>% select(accession, function.) %>% 
+                          rename(Var2 = accession), by = "Var2") %>% 
+            arrange(desc(R)), 
+          file = "BASE_DIR/PLASMIDOME_results/COG_diet_corr.tsv", sep = "\t", row.names = F)
+
+```
+```{r}
+library(MicrobiomeProfiler)
+
+good_corr <- corr_genes_diet$table %>%  filter(!is.na(r_if_sig)) %>% select(-r_if_sig) %>% 
+  filter((Var1 %in% c("aMED", "HEI_2015", "hPDI") & R > 0) | (Var2 == "uPDI" & R< 0)) %>% pull(Var2) %>% unique()
+
+good_category <- enrichCOG(
+  good_corr,
+  dtype = "category", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result 
+ 
+
+good_pathway <- enrichCOG(
+  good_corr,
+  dtype = "pathway", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result
+
+bad_corr <- corr_genes_diet$table %>%  filter(!is.na(r_if_sig)) %>% select(-r_if_sig) %>% 
+  filter((Var1 %in% c("aMED", "HEI_2015", "hPDI") & R < 0) | (Var2 == "uPDI" & R > 0)) %>% pull(Var2) %>% unique()
+
+COG_category_CD_over <- enrichCOG(
+  bad_corr,
+  dtype = "category", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result 
+ 
+
+COG_category_CD_under <- enrichCOG(
+  bad_corr,
+  dtype = "category", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result 
+```
+
+
+
+```{r}
+
+# compare plasmids related with IBD with plasmids correlated with diet
+IBD_pfam <- read.table(file = "BASE_DIR/PLASMIDOME_results/Pfam_ancomBC.tsv", header = T, sep = '\t', quote = "") %>% 
+  mutate(Abundance = ifelse(lfc > 0, "+", "-")) %>% mutate(label = paste0(Disease, Abundance)) %>% rename(Plasmid_ID = accession) %>% 
+  select(Plasmid_ID, label) %>% group_by(Plasmid_ID) %>% summarise(label = paste0(label, collapse = ","))
+
+
+corr_genes_diet_pfam <- corrplot_from_physeq_complexHeatmap_arnau(phy_obj = phylist_plasmids[["phy_rpkm_pfam"]], corrmethod = "spearman", 
+                                                   interest_metadata = interest_variables$diet_variables, colnames_table = interest_variables,
+                                                   AncomBC_results = IBD_pfam, row_fontsize = 0,
+                                                   col_fun = colorRamp2(c(-0.3, 0, 0.3), c("#0D0887FF", "white", "darkgoldenrod2")), 
+                                                   row_label = "COGs", cols_label = "dietary variables", n_cols = T, n_rows = T)
+
+corr_genes_diet_pfam$plot
+
+write.table(x = corr_genes_diet_pfam$table %>% filter(!is.na(r_if_sig)) %>% select(-r_if_sig) %>% 
+              left_join(phylist_plasmids[["phy_rpkm_pfam"]]@tax_table %>% data.frame() %>% select(accession, function.) %>% 
+                          rename(Var2 = accession), by = "Var2") %>% 
+            arrange(desc(R)), 
+          file = "BASE_DIR/PLASMIDOME_results/Pfam_diet_corr.tsv", sep = "\t", row.names = F)
+```
+
+
+
+```{r}
+corr_genes_diet_AMR <- corrplot_from_physeq_complexHeatmap_arnau(phy_obj = phylist_plasmids[["phy_AMR"]], corrmethod = "spearman", 
+                                                   interest_metadata = c("Item1", "Item2", "Item3", "Item4", "Item5", 
+                                                                        "Item6", "Item7", "Item8", "Item9", "Item10", "Item11", "Item12", 
+                                                                        "Item13", "Item14", "Item15", "Item16", "Item17", "Item18", "Item19", 
+                                                                        "Item20", "Item21", "Item22", "Item23", "Item24", "Item25", "Item26", 
+                                                                        "Item27", "Item28", "Item29", "Item30", "Item31", "Item32", "Item33", 
+                                                                        "Item34", "Item35", "Item36", "Item37", "Item38", "Item39", "Item40", 
+                                                                        "Item41", "Item42", "Item43", "Item44", "Item45", "Item46", "Item47", 
+                                                                        "Item48", "Item49", "Item50", "Item51", "Item52", "Item53", "Item54", 
+                                                                        "Item55", "Item56", "Item57", "Item58",
+                                                                        "Energy_kcal", "Total_Fat_g", "Total_Protein_g", 
+                                                                "Water_g", "Fibre_g", "CHO_g", "MUFA_g", "PUFA_g", "SFA_g", "Cholesterol_mg", 
+                                                                "VitA_ret_eq_mcg", "VitD_mcg", "VitE_alpha_tocoferol_mg", "Biotin_mcg", 
+                                                                "Total_Folate_mcg", "Total_Niacin_eq_mg", "VitB5_mg", "Riboflavin_mg", 
+                                                                "Tiamin_mg", "VitB12_mcg", "VitB6_mg", "VitC_mg", "Calcium_mg", 
+                                                                "Iron_mg", "Potassium_mg", "Magnesium_mg", "Sodium_mg", "Phosphorus_mg", 
+                                                                "Iodur_mcg", "Selenium_mcg", "Zinc_mg", "Alcohol_g", "Sugar_g", 
+                                                                "HEI_2015", "PDI_Adj", "hPDI_Adj", 
+                                                                "uPDI_Adj", "aMED"))
+
+corr_genes_diet_AMR$plot
+```

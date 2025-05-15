@@ -1,0 +1,1987 @@
+# Libraries
+```{r}
+library(plyr)
+library(tidyverse)
+library(pheatmap)
+library(ggplot2)
+library(ape)
+library(ComplexHeatmap)
+library(circlize)
+library(edgeR)
+library(readxl)
+library(umap)
+library(ecodist)
+library(rnndescent)
+library(uwot)
+library(phyloseq)
+library(scales)
+library(randomcoloR)
+library(magrittr)
+library(cowplot)
+library(gridExtra)
+library(viridis)
+library(ANCOMBC)
+library(MicrobiomeProfiler)
+library(ggrepel)
+source("BASE_DIR/SCRIPTS/omics_analyses_functions.R")
+source("BASE_DIR/SCRIPTS/PLASMIDOME/plasmidome_analysis_functions.R")
+source("BASE_DIR/SCRIPTS/diversity.R")
+```
+
+```{r}
+# Color palettes
+colors <- list(disease = c("Healthy" = "#7AD151FF", "UC" = "#FDE725FF", "CD" = "#414487FF"), 
+               project = c("POP" = "#46F884FF", "IBD Validation" = "#F05B12FF", "Longitudinal Mycobiome" = "#3E9BFEFF"),
+               gender = c("m" = "#395D9CFF", "f" = "#60CEACFF"), 
+               circularity = c("#FCA50AFF", "#932667FF"), 
+               only_complete = c("all" = "#FFEA46FF", "only_complete" = "#31446BFF"), 
+               general_palette_other = c(viridis_pal(option = "H", begin = 0.3, end = 0.1, direction = 1)(3), 
+                                         viridis_pal(direction = 1)(10), viridis_pal(option = "C", direction = -1)(10), 
+                                         viridis_pal(option = "H", begin = 1, end = 0.77)(3), "#BEBEBE" ),
+               general_palette = c(viridis_pal(option = "H", begin = 0.3, end = 0.1, direction = 1)(3), 
+                                   viridis_pal(direction = 1)(10), viridis_pal(option = "C", direction = -1)(10), 
+                                   viridis_pal(option = "H", begin = 1, end = 0.77)(3)),
+               sensitivity = c("passed" = "black", "failed" = "#606060", "struc_zero" = "red"))
+
+show_col(colors$general_palette)
+```
+
+
+
+# Read input files
+## Metadata
+
+```{r}
+
+sample_list <- read.table(file = 'BASE_DIR/SAMPLE_LISTS/AllSamples.txt', header = F, sep = '\t', 
+                          col.names = c("SubjectID", "Study"), colClasses = c("character", "factor")) %>% 
+  mutate(Study = case_when(Study == "POP" ~ "POP", Study == "LONGITUDINAL_MYCOBIOME" ~ "Longitudinal Mycobiome",
+                           Study == "LUISITO_IBD" ~ "IBD Validation"))
+
+Luisito_metadata <- read_xlsx(path = 'BASE_DIR/SAMPLE_LISTS/metadata_IBD_Validation_CD_UC_Nov_24_GSG.xlsx',
+                              sheet = 1, col_names = T) %>% 
+  rename(Disease = `IBD type(1=CD, 2=UC)`) %>%
+  mutate(SubjectID = gsub(pattern = '.', replacement = '_', x = paste0(SubjectID, 'B'), fixed = T)) %>% 
+  filter(SubjectID %in% sample_list$SubjectID, Disease != '') %>% 
+  mutate(Gender = case_when(gender == 'H' ~ 'm', gender == 'M' ~ 'f'))
+# Fix some heights
+Luisito_metadata[Luisito_metadata$SubjectID == "VH_CD_031B", "height (m)"] <- "1.72"
+Luisito_metadata[Luisito_metadata$SubjectID == "VH_CD_030B", "height (m)"] <- "1.76"
+Luisito_metadata[Luisito_metadata$SubjectID == "VH_CD_019B", "height (m)"] <- "1.5"
+Luisito_metadata[Luisito_metadata$SubjectID == "VH_UC_020B", "height (m)"] <- "1.7"
+Luisito_metadata[Luisito_metadata$SubjectID == "VH_UC_012B", "height (m)"] <- "1.7"
+Luisito_metadata[Luisito_metadata$SubjectID == "VH_CD_039B", "height (m)"] <- "1.7"
+Luisito_metadata$`height (m)` <- as.numeric(Luisito_metadata$`height (m)`)
+Luisito_metadata$`weigth (kg)` <- as.numeric(Luisito_metadata$`weigth (kg)`)
+Luisito_metadata <- Luisito_metadata %>% mutate(BMI_value = `weigth (kg)` / (Luisito_metadata$`height (m)`)^2 ) %>% 
+  mutate(BMI = case_when(BMI_value < 18.5 ~ 'underweight', BMI_value < 25 ~ 'healthy weight',
+                         BMI_value < 30 ~ 'overweight', BMI_value >= 30 ~ 'obesity')) %>% 
+  mutate(Height = `height (m)` * 100) %>%
+  rename(Weight = `weigth (kg)`)
+
+
+Longitudinal_metadata <- read.table('/mnt/synology/ZIXUAN/LongitudinalMycobiome/metadata.csv', header = T, sep = '\t') %>%
+  filter(SampleID %in% sample_list$SubjectID) %>% mutate(Gender = case_when(Gender == 'Male' ~ 'm', Gender == 'Female' ~ 'f')) %>%
+  mutate(Disease = 'Healthy') %>%  
+  rename(SubjectID = SampleID)
+Longitudinal_metadata[Longitudinal_metadata$BMI == "healthy weight ", "BMI"] <- "healthy weight"
+
+```
+
+
+Process POP metadata 
+```{r}
+metadata <- read.table(file = 'BASE_DIR/WEB_FILES/Integred_met_aug24.tsv', sep = '\t', header = T)
+colnames(metadata) <- gsub("\\.", "_", colnames(metadata))
+diversity <- read.table(file = '/mnt/synology/DATA_ANALYSIS/POP_STUDY/alpha_div_bact.csv', sep = ',', header = T) %>%
+  rename(Novogene_ID = ID)
+
+
+metadata$ID <- gsub(pattern = 'Hc_D', replacement = 'HC_D', x = metadata$ID, ignore.case = F, fixed = T)
+metadata$Code <- gsub(pattern = 'Hc_D', replacement = 'HC_D', x = metadata$Code, ignore.case = F, fixed = T)
+
+## Change first sample for individual who changed gender between questionnaires
+metadata[metadata$ID == 'HC_D1046_0', 'Gender'] <- 'other'
+
+# Group by each ID and calculate mean values (only relevant variables)
+# all genders must be the same for a single individual
+selected_metadata <- metadata %>% rename(n_Survey = n_Survey_y, hPDI_Adj = hDPI_Adj, uPDI_Adj = uDPI_Adj)
+
+integrated_metadata <- left_join(selected_metadata, diversity %>% select(Chao1, Shannon, Novogene_ID), by = 'Novogene_ID')
+
+############################## MOMENTARY FIX FOR SOME PDI indexes that were calculated wrong in 2nd timepoint
+PDI_fix <- read.table(file = 'BASE_DIR/WEB_FILES/dpi_adj_TP2_aug24.csv', sep = '\t', header = T)
+PDI_fix$RN_ID <- gsub(pattern = 'Hc_D', replacement = 'HC_D', x = PDI_fix$RN_ID, ignore.case = F, fixed = T)
+
+integrated_metadata[match(PDI_fix$RN_ID, integrated_metadata$ID), 'hPDI_Adj'] <- PDI_fix$hDPI
+integrated_metadata[match(PDI_fix$RN_ID, integrated_metadata$ID), 'uPDI_Adj'] <- PDI_fix$uDPI
+
+POP_metadata <- integrated_metadata %>% filter(Novogene_ID %in% sample_list$SubjectID)
+```
+
+Join everything
+```{r}
+# Important metadata columns: Weight, Height, Age, Gender, BMI_value, BMI, Disease, SubjectID
+
+join_POP <- POP_metadata %>% rename(SubjectID = Novogene_ID) %>% mutate(Disease = 'Healthy', Study = 'POP') %>% 
+  rename(BMI_value = BMI) %>%
+  mutate(BMI = case_when(BMI_value < 18.5 ~ 'underweight', BMI_value < 25 ~ 'healthy weight',
+                         BMI_value < 30 ~ 'overweight', BMI_value >= 30 ~ 'obesity')) %>%
+  select(Study, SubjectID, Disease, Age, Gender, Weight, Height, BMI, BMI_value)
+join_Luisito <- Luisito_metadata %>% mutate(Study = 'IBD Validation') %>%
+  select(Study, SubjectID, Disease, Age, Gender, Weight, Height, BMI, BMI_value)
+join_longitudinal <- Longitudinal_metadata %>% mutate(Study = 'Longitudinal Mycobiome') %>%
+  select(Study, SubjectID, Disease, Age, Gender, Weight, Height, BMI, BMI_value)
+
+joint_metadata <- left_join(sample_list, rbind(join_POP, join_Luisito, join_longitudinal), by = c('SubjectID', 'Study')) %>%
+  filter(!is.na(Disease))
+```
+
+
+## Sequencing depth
+```{r}
+n_reads <- read.table(file = 'BASE_DIR/SAMPLE_LISTS/sequencing_stats.txt', 
+                      header = F, sep = ' ', col.names = c('SubjectID', 'n_reads'), skip = 1)
+joint_metadata <- left_join(joint_metadata, n_reads, by = 'SubjectID')
+rownames(joint_metadata) <- joint_metadata$SubjectID
+
+```
+
+## Counts tables
+```{r}
+coverage <- read.table(file = 'BASE_DIR/PROFILING/coverage.tsv', header = T, sep = '\t') %>% 
+  select(all_of(c('pCode', joint_metadata$SubjectID)))
+rownames(coverage) <- coverage$pCode
+numreads <- read.table(file = 'BASE_DIR/PROFILING/numreads.tsv', header = T, sep = '\t') %>%
+  select(all_of(c('pCode', joint_metadata$SubjectID)))
+rownames(numreads) <- numreads$pCode
+
+# ensure a minimum of 50% coverage or else count it as missing
+numreads[coverage < 50] <- 0
+
+
+#meandepth <- read.table(file = 'BASE_DIR/PROFILING/meandepth.tsv', header = T, sep = '\t') %>% select(all_of(c('pCode', joint_metadata$SubjectID)))
+#rownames(meandepth) <- meandepth$pCode
+
+coverage_only_complete <- read.table(file = 'BASE_DIR/PROFILING/coverage_only-complete.tsv', 
+                                     header = T, sep = '\t') %>%select(all_of(c('pCode', joint_metadata$SubjectID)))
+rownames(coverage_only_complete) <- coverage_only_complete$pCode
+numreads_only_complete <- read.table(file = 'BASE_DIR/PROFILING/numreads_only-complete.tsv', 
+                                     header = T, sep = '\t') %>% select(all_of(c('pCode', joint_metadata$SubjectID)))
+rownames(numreads_only_complete) <- numreads_only_complete$pCode
+
+# ensure a minimum of 50% coverage or else count it as missing
+numreads_only_complete[coverage_only_complete < 50] <- 0
+
+#meandepth_only_complete <- read.table(file = 'BASE_DIR/PROFILING/meandepth_only-complete.tsv', header = T, sep = '\t') %>% select(all_of(c('pCode', joint_metadata$SubjectID)))
+#rownames(meandepth_only_complete) <- meandepth_only_complete$pCode
+```
+
+## Plasmid info 
+```{r}
+plasmid_clusters <- read.table("BASE_DIR/MOBMESS/plasmids-mobmess_clusters.txt", header = T, sep = '\t', 
+                               na.strings = c("NA", "")) %>% filter(contig %in% rownames(numreads)) %>% rename(Plasmid_ID = contig) 
+
+plasmid_info <- read.table(file = 'BASE_DIR/PLASMIDS/nonredundant_plasmids_info.txt', 
+                           header = T, sep = '\t', na.strings = c("NA", "")) %>% 
+  right_join(y = plasmid_clusters %>% select(Plasmid_ID, cluster_type, systems), by = "Plasmid_ID") 
+
+rownames(plasmid_info) <- plasmid_info$Plasmid_ID
+
+CARD_resistance <- read.table("BASE_DIR/CARD/CARD_hits.txt", header = T, sep = "\t", comment.char = "", quote = "") %>% mutate(Plasmid_ID = unlist(strsplit(Contig, split = "_[0-9]+$"))) %>% group_by(Plasmid_ID) %>% 
+  summarise(ARG = T, n_ARG = n(), Best_Hit_ARO = paste0(Best_Hit_ARO, collapse = ";"), Drug.Class = paste0(unique(Drug.Class), collapse = ";"),
+            Resistance.Mechanism = paste0(unique(Resistance.Mechanism), collapse = ";"), 
+            AMR.Gene.Family = paste0(unique(AMR.Gene.Family), collapse = ";"),
+            Antibiotic = paste0(unique(Antibiotic), collapse = ";"))
+
+plasmid_info <- plasmid_info %>% left_join(CARD_resistance, by = "Plasmid_ID")
+
+```
+
+## Gene content
+```{r}
+genecalls <- read.table(file = "BASE_DIR/ANVIO/FINAL_PLASMIDS/nonredundant_plasmids-gene-calls.txt", 
+                        header = T, sep = "\t", quote = "") %>% select(-aa_sequence)
+cogs_pfams <- read.table(file = "BASE_DIR/ANVIO/FINAL_PLASMIDS/nonredundant_plasmids-cogs-and-pfams.txt",
+                         quote = "", header = T, sep = "\t")
+
+gene_content <- right_join(genecalls, cogs_pfams, by = "gene_callers_id") %>% rename(Plasmid_ID = contig)
+```
+
+
+# Phyloseq object
+
+```{r}
+MET <- sample_data(joint_metadata)
+rownames(MET) <- rownames(joint_metadata)
+
+# Get a list with plasmids and their plasmid systems as a taxonomy approximation 
+# However, some plasmids are assigned to multiple systems
+# Instead, cluster all systems containing overlapping plasmids into just one
+plasmid_systems <- plasmid_clusters %>% select(Plasmid_ID, systems)
+# Get a list of all systems
+systems_list <- data.frame(system = plasmid_systems %>% filter(!is.na(systems)) %>% pull(systems) %>% 
+                             strsplit(split = "|", fixed = T) %>% unlist() %>% unique(),
+                           representative = as.character(NA))
+rownames(systems_list) <- systems_list$system
+# For each system, see if other systems are annotated to plasmids found in it: 
+for (system in systems_list$system) {
+  # Check the systems that this one system shares plasmids with 
+  similar_systems <- plasmid_systems[grepl(pattern = paste0("\\b", system, "\\b"), x = plasmid_systems$systems, fixed = F), "systems"] %>% 
+    strsplit(split = "|", fixed = T) %>% unlist() %>% unique()
+  # If none of them have a representative yet, select this one 
+  if (all(is.na(systems_list[similar_systems, "representative"]))) {
+    representative <- system
+  } else {
+    # If some have, check if they all have the same representative
+    non_NA_reps <- systems_list[similar_systems, ] %>% filter(!is.na(representative)) %>% pull(representative) %>% unique()
+    if (length(non_NA_reps) == 1) {
+      # If so, just select that same representative
+      representative <- non_NA_reps[1]
+    } else {
+      # If they have several representatives, merge them by selecting the first and changing the others
+      representative <- non_NA_reps[1]
+      systems_list[systems_list$representative %in% non_NA_reps, "representative"] <- representative 
+    }
+  }
+  # Then put the selected representative for the similar systems
+  systems_list[similar_systems, "representative"] <- representative
+}
+
+# Save the newly annotated systems for each plasmid 
+plasmid_systems$system <- plasmid_systems$systems
+for (row in 1:nrow(plasmid_systems)) {
+  # For each plasmid, get the list of systems it's annotated in 
+  systems <- plasmid_systems[row, "systems"] %>% strsplit(split = "|", fixed = T) %>% unlist() %>% unique()
+  # if it's NA, skip, it will remain NA
+  if (any(is.na(systems))) {
+    next
+  }
+  # Else, get the list of representatives
+  reps <- systems_list[systems, "representative"]
+  if(length(unique(reps)) > 1) {
+    # Ensure there's no errors 
+    print(paste0("ERROR: Plasmid ", plasmid_systems[row, "Plasmid_ID"], " has multiple representatives."))
+  } else {
+    plasmid_systems[row, "system"] <- reps[1]
+  }
+}
+rownames(plasmid_systems) <- plasmid_systems$Plasmid_ID
+
+
+# Change plasmid systems names so they are PSS74 instead of PS94|PS734|PS843|etc.
+rename_plasmid_systems <- data.frame(systems = unique(plasmid_info$systems)[!is.na(unique(plasmid_info$systems))])
+rename_plasmid_systems$newsystems <- paste0("PSS", 1:nrow(rename_plasmid_systems))
+
+plasmid_info <- plasmid_info %>% left_join(rename_plasmid_systems, by = "systems") %>% select(-systems) %>% 
+  rename(systems = newsystems)
+rownames(plasmid_info) <- plasmid_info$Plasmid_ID
+
+
+
+taxa_info <- plasmid_systems %>% select(system, Plasmid_ID) %>% cbind(plasmid_info[rownames(plasmid_systems), ] %>% select(-Plasmid_ID))
+
+TAX <- tax_table(as.matrix(taxa_info))
+
+
+counts_matrix <- numreads %>% select(- pCode) %>% as.matrix.data.frame()
+rownames(counts_matrix) <- numreads$pCode
+
+coverage_matrix <- coverage %>% select(- pCode) %>% as.matrix.data.frame() 
+rownames(coverage_matrix) <- coverage$pCode
+
+# Require a minimum coverage to count the reads mapping to a plasmid; otherwise convert it to 0:
+#counts_matrix[coverage_matrix < 50] <- 0
+
+OTU <- otu_table(counts_matrix, taxa_are_rows = TRUE)
+
+phycount_plasmids <- phyloseq(OTU, TAX, MET)
+
+counts_matrix_only_complete <- numreads_only_complete %>% select(- pCode) %>% as.matrix.data.frame() 
+rownames(counts_matrix_only_complete) <- numreads_only_complete$pCode
+
+coverage_matrix_only_complete <- coverage_only_complete %>% select(- pCode) %>% as.matrix.data.frame() 
+rownames(coverage_matrix_only_complete) <- coverage_only_complete$pCode
+
+OTU_oc <- otu_table(counts_matrix_only_complete, taxa_are_rows = TRUE)
+TAX_oc <- tax_table(as.matrix(taxa_info[rownames(counts_matrix_only_complete),]))
+phycount_plasmids_only_complete <- phyloseq(OTU_oc, TAX_oc, MET)
+
+```
+
+
+
+
+## RPKM
+```{r}
+rpkm_matrix <- rpkm(counts_matrix, gene.length = plasmid_info[rownames(counts_matrix), "Length"], log = F, 
+                        lib.size = joint_metadata[colnames(counts_matrix), "n_reads"])
+OTUrpkm <- otu_table(rpkm_matrix, taxa_are_rows = TRUE)
+phyrpkm_plasmids <- phyloseq(OTUrpkm, TAX, MET)
+
+rpkm_matrix_log <- rpkm(counts_matrix, gene.length = plasmid_info[rownames(counts_matrix), "Length"], log = T, 
+                        lib.size = joint_metadata[colnames(counts_matrix), "n_reads"])
+OTUrpkm_log <- otu_table(rpkm_matrix_log, taxa_are_rows = TRUE)
+phyrpkm_plasmids_log <- phyloseq(OTUrpkm_log, TAX, MET)
+
+
+rpkm_matrix_only_complete <- rpkm(counts_matrix_only_complete, gene.length = plasmid_info[rownames(counts_matrix_only_complete), "Length"],
+                                      log = F, lib.size = joint_metadata[colnames(counts_matrix_only_complete), "n_reads"])
+OTU_oc_rpkm <- otu_table(rpkm_matrix_only_complete, taxa_are_rows = TRUE)
+phyrpkm_plasmids_only_complete <- phyloseq(OTU_oc_rpkm, TAX_oc, MET)
+
+rpkm_matrix_log_only_complete <- rpkm(counts_matrix_only_complete, gene.length = plasmid_info[rownames(counts_matrix_only_complete), "Length"],
+                                      log = T, lib.size = joint_metadata[colnames(counts_matrix_only_complete), "n_reads"])
+OTU_oc_rpkm_log <- otu_table(rpkm_matrix_log_only_complete, taxa_are_rows = TRUE)
+phyrpkm_plasmids_only_complete_log <- phyloseq(OTU_oc_rpkm_log, TAX_oc, MET)
+
+```
+
+## Distance matrix
+```{r}
+# Calculate distance between samples with Bray-Curtis
+D <- bcdist(rpkm_matrix %>% t())
+dist_tree <- hclust(D, method = "complete")
+
+D_oc <- bcdist(rpkm_matrix_only_complete %>% t())
+dist_tree_oc <- hclust(D_oc, method = "complete")
+```
+
+## Gene-level info 
+
+```{r}
+# read gene-level reads
+gene_reads <- read.table(file = "BASE_DIR/PROFILING/gene_profiling.tsv", header = T, sep = "\t")
+
+# then left join on a table with just the gene_caller_id and the accession
+COG20_otu <- gene_content %>% filter(source.y == "COG20_FUNCTION") %>% select(gene_callers_id, accession) %>% 
+  left_join(gene_reads %>% select(gene_callers_id, all_of(joint_metadata$SubjectID)), by = "gene_callers_id") %>%
+  # Separate the accessions that are multiple accessions separated by !!! into different rows 
+  separate_longer_delim(cols = accession, delim = "!!!") %>% 
+  # then drop the gene_callers_id, group by accession and sum the genes with the same accession 
+  select(-gene_callers_id) %>% group_by(accession) %>% summarise(across(.cols = all_of(joint_metadata$SubjectID), 
+                                                                        .fns = list(sum), .names = "{.col}"))
+pfam_otu <- gene_content %>% filter(source.y == "Pfam") %>% select(gene_callers_id, accession) %>% 
+  left_join(gene_reads %>% select(gene_callers_id, all_of(joint_metadata$SubjectID)), by = "gene_callers_id") %>%
+  # then drop the gene_callers_id, group by accession and sum the genes with the same accession 
+  select(-gene_callers_id) %>% group_by(accession) %>% summarise(across(.cols = all_of(joint_metadata$SubjectID), 
+                                                                        .fns = list(sum), .names = "{.col}"))
+
+COG_matrix <- COG20_otu %>% select(- accession) %>% as.matrix.data.frame()
+rownames(COG_matrix) <- COG20_otu$accession
+pfam_matrix <- pfam_otu %>% select(- accession) %>% as.matrix.data.frame()
+rownames(pfam_matrix) <- pfam_otu$accession
+
+OTU_COG <- otu_table(COG_matrix, taxa_are_rows = TRUE)
+OTU_pfam <- otu_table(pfam_matrix, taxa_are_rows = TRUE)
+
+#get gene info
+COG20_info <- gene_content %>% filter(source.y == "COG20_FUNCTION") %>% mutate(length = stop - start) %>% 
+  # Separate the accessions that are multiple accessions separated by !!! into different rows 
+  separate_longer_delim(cols = c(accession, function.), delim = "!!!") %>% 
+  # group by accession 
+  group_by(accession) %>% summarise(gene_callers_ids = paste0(gene_callers_id, collapse = ","), 
+                                    Plasmid_IDs = paste0(Plasmid_ID, collapse = ","),
+                                    source.x = unique(source.x), source.y = unique(source.y), version = unique(version),
+                                    function. = unique(function.), 
+                                    partial_each = paste0(partial, collapse = ","),
+                                    avg_length = case_when(all(partial == 0) ~ round(mean(length)),
+                                                           all(partial == 1) ~ max(length),
+                                                           TRUE ~ round(mean(length[partial == 0]))) ) %>% data.frame()
+rownames(COG20_info) <- COG20_info$accession
+#get gene info
+pfam_info <- gene_content %>% filter(source.y == "Pfam") %>% mutate(length = stop - start) %>% 
+  # group by accession 
+  group_by(accession) %>% summarise(gene_callers_ids = paste0(gene_callers_id, collapse = ","), 
+                                    Plasmid_IDs = paste0(Plasmid_ID, collapse = ","),
+                                    source.x = unique(source.x), source.y = unique(source.y), version = unique(version),
+                                    function. = unique(function.), 
+                                    partial_each = paste0(partial, collapse = ","),
+                                    avg_length = case_when(all(partial == 0) ~ round(mean(length)),
+                                                           all(partial == 1) ~ max(length),
+                                                           TRUE ~ round(mean(length[partial == 0]))) ) %>% data.frame()
+rownames(pfam_info) <- pfam_info$accession
+
+TAX_COG <- tax_table(as.matrix(COG20_info))
+TAX_pfam <- tax_table(as.matrix(pfam_info))
+
+phycount_COG20 <- phyloseq(OTU_COG, TAX_COG, MET)
+phycount_pfam <- phyloseq(OTU_pfam, TAX_pfam, MET)
+
+
+COG_rpkm_matrix <- rpkm(COG_matrix, gene.length = COG20_info[rownames(COG_matrix), "avg_length"], log = F, 
+                        lib.size = joint_metadata[colnames(COG_matrix), "n_reads"])
+COG_OTUrpkm <- otu_table(COG_rpkm_matrix, taxa_are_rows = TRUE)
+phyrpkm_COG <- phyloseq(COG_OTUrpkm, TAX_COG, MET)
+
+rpkm_matrix_log <- rpkm(COG_matrix, gene.length = COG20_info[rownames(COG_matrix), "avg_length"], log = T, 
+                        lib.size = joint_metadata[colnames(COG_matrix), "n_reads"])
+COGrpkm_log <- otu_table(rpkm_matrix_log, taxa_are_rows = TRUE)
+phyrpkm_COG_log <- phyloseq(COGrpkm_log, TAX_COG, MET)
+
+
+pfam_rpkm_matrix <- rpkm(pfam_matrix, gene.length = pfam_info[rownames(pfam_matrix), "avg_length"], log = F, 
+                        lib.size = joint_metadata[colnames(pfam_matrix), "n_reads"])
+pfam_OTUrpkm <- otu_table(pfam_rpkm_matrix, taxa_are_rows = TRUE)
+phyrpkm_pfam <- phyloseq(pfam_OTUrpkm, TAX_pfam, MET)
+
+rpkm_matrix_log <- rpkm(pfam_matrix, gene.length = pfam_info[rownames(pfam_matrix), "avg_length"], log = T, 
+                        lib.size = joint_metadata[colnames(pfam_matrix), "n_reads"])
+pfamrpkm_log <- otu_table(rpkm_matrix_log, taxa_are_rows = TRUE)
+phyrpkm_pfam_log <- phyloseq(pfamrpkm_log, TAX_pfam, MET)
+
+
+```
+
+
+
+## Tax glom for system and for rep types, etc
+
+```{r}
+glom_plasmids <- function(phy, group_variable, na_value = "none"){
+  # Get a reordered taxa table so the grouping variable is to the left
+  new_tax_table <- tax_table(phy) %>% data.frame() %>% select(all_of(group_variable), Plasmid_ID) %>% 
+    replace_na(setNames(object = list(na_value), nm = group_variable))
+  # Replace the tax table with the new one
+  tax_table(phy) <- tax_table(as.matrix(new_tax_table))
+  # do the tax glom 
+  phy_glom <- tax_glom(phy, taxrank = group_variable)
+  # Rename the taxa names so they are at the new taxa level 
+  taxa_names(phy_glom) <- tax_table(phy_glom)[taxa_names(phy_glom), group_variable]
+  return(phy_glom)
+}
+
+
+phy_system <- glom_plasmids(phyrpkm_plasmids, group_variable = "system")
+phy_systems <- glom_plasmids(phyrpkm_plasmids, group_variable = "systems")
+phy_rep <- glom_plasmids(phyrpkm_plasmids, group_variable = "rep_type.s.")
+phy_relaxase <- glom_plasmids(phyrpkm_plasmids, group_variable = "relaxase_type.s.")
+phy_mpf <- glom_plasmids(phyrpkm_plasmids, group_variable = "mpf_type")
+phy_orit <- glom_plasmids(phyrpkm_plasmids, group_variable = "orit_type.s.")
+phy_mobility <- glom_plasmids(phyrpkm_plasmids, group_variable = "predicted_mobility")
+phy_cluster_type <- glom_plasmids(phyrpkm_plasmids, group_variable = "cluster_type")
+phy_circularity <- glom_plasmids(phyrpkm_plasmids, group_variable = "Circularity", na_value = "linear")
+phy_AMR <- glom_plasmids(phyrpkm_plasmids, group_variable = "ARG", na_value = "FALSE")
+
+
+phy_system_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "system")
+phy_systems_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "systems")
+phy_rep_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "rep_type.s.")
+phy_relaxase_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "relaxase_type.s.")
+phy_mpf_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "mpf_type")
+phy_orit_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "orit_type.s.")
+phy_mobility_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "predicted_mobility")
+phy_cluster_type_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "cluster_type")
+phy_circularity_oc <- glom_plasmids(phyrpkm_plasmids_only_complete, group_variable = "Circularity", na_value = "linear")
+```
+
+
+## Phyloseq list
+```{r}
+
+phylist_plasmids <- list(phy_count = phycount_plasmids, phy_rpkm = phyrpkm_plasmids, phy_logrpkm = phyrpkm_plasmids_log,
+                         coverage_matrix = coverage_matrix, annotation = gene_content, dist = D, dist_tree = dist_tree, 
+                         phy_system_rpkm = phy_system, phy_systems_rpkm = phy_systems, phy_rep_rpkm = phy_rep, 
+                         phy_relaxase_rpkm = phy_relaxase, phy_mpf_rpkm = phy_mpf, phy_orit_rpkm = phy_orit, 
+                         phy_mobility_rpkm = phy_mobility, phy_cluster_type_rpkm = phy_cluster_type, 
+                         phy_circularity_rpkm = phy_circularity, phy_AMR = phy_AMR,
+                         phy_count_COG20 = phycount_COG20, phy_rpkm_COG20 = phyrpkm_COG, phy_logrpkm_COG20 = phyrpkm_COG_log,
+                         phy_count_pfam = phycount_pfam, phy_rpkm_pfam = phyrpkm_pfam, phy_logrpkm_pfam = phyrpkm_pfam_log)
+
+phylist_plasmids_only_complete <- list(phy_count = phycount_plasmids_only_complete, phy_rpkm = phyrpkm_plasmids_only_complete, 
+                                       phy_logrpkm = phyrpkm_plasmids_only_complete_log,
+                                       coverage_matrix = coverage_matrix_only_complete, 
+                                       annotation = gene_content %>% filter(Plasmid_ID %in% rownames(coverage_matrix_only_complete)), 
+                                       dist = D_oc, dist_tree = dist_tree_oc,
+                                       phy_system_rpkm = phy_system_oc, phy_systems_rpkm = phy_systems_oc, phy_rep_rpkm = phy_rep_oc,
+                                       phy_relaxase_rpkm = phy_relaxase_oc, phy_mpf_rpkm = phy_mpf_oc, phy_orit_rpkm = phy_orit_oc, 
+                         phy_mobility_rpkm = phy_mobility_oc, phy_cluster_type_rpkm = phy_cluster_type, 
+                         phy_circularity_rpkm = phy_circularity)
+
+
+#Save phyloseq objects 
+save(phylist_plasmids, phylist_plasmids_only_complete, colors, rename_plasmid_systems,
+     file = "BASE_DIR/PROFILING/phyloseq.RData")
+```
+
+
+#START HERE
+## Load phyloseq
+```{r}
+load(file = "BASE_DIR/PROFILING/phyloseq_complete.RData")
+
+# Also filter out plasmids with not enough prevalence
+filt_plasmids <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_count"]]@otu_table), abundance = 0,
+                                                               prevalence = 0)[[2]]
+filt_systems <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_systems_rpkm"]]@otu_table), abundance = 0,
+                                                               prevalence = 0)[[2]]
+filt_COG <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_rpkm_COG20"]]@otu_table), abundance = 0,
+                                                               prevalence = 0)[[2]]
+filt_pfam <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_rpkm_pfam"]]@otu_table), abundance = 0,
+                                                               prevalence = 0)[[2]]
+
+
+phylist_plasmids[["phy_count"]] <- phylist_plasmids[["phy_count"]] %>% subset_taxa(!Plasmid_ID %in% filt_plasmids)
+phylist_plasmids[["phy_rpkm"]] <- phylist_plasmids[["phy_rpkm"]] %>% subset_taxa(!Plasmid_ID %in% filt_plasmids)
+phylist_plasmids[["phy_logrpkm"]] <- phylist_plasmids[["phy_logrpkm"]] %>% subset_taxa(!Plasmid_ID %in% filt_plasmids)
+phylist_plasmids[["phy_systems_rpkm"]] <- phylist_plasmids[["phy_systems_rpkm"]] %>% subset_taxa(!systems %in% filt_systems)
+phylist_plasmids[["phy_rpkm_COG20"]] <- phylist_plasmids[["phy_rpkm_COG20"]] %>% subset_taxa(!accession %in% filt_COG)
+phylist_plasmids[["phy_rpkm_pfam"]] <- phylist_plasmids[["phy_rpkm_pfam"]] %>% subset_taxa(!accession %in% filt_pfam)
+
+
+#Filter out for now samples from LONGITUDINAL MYCOBIOME that are not the first timepoint (to avoid overrepresentation of those participants)
+
+eliminate_mycobiome <- c("L1_2C", "L1_3C", "L1_4C", "L1_5C", "L1_6C", "L1_7C", "L1_8C", "L2_2C", "L2_3C", "L2_4C", "L2_5C", "L2_6C", "L2_7C",
+                         "L2_8C", "L3_2C", "L3_3C", "L3_4C", "L3_5C", "L3_6C", "L3_7C", "L3_8C", "L4_3C", "L4_4C", "L4_5C", "L4_6C",
+                         "L4_7C", "L4_8C","L5_2C", "L5_3C", "L5_4C", "L5_5C", "L5_6C", "L5_7C", "L5_8C", "L6_2C", "L6_3C", "L6_4C", "L6_5C",
+                         "L6_6C", "L6_7C", "L6_8C")
+
+phylist_plasmids[["phy_count"]] <- phylist_plasmids[["phy_count"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_rpkm"]] <- phylist_plasmids[["phy_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_logrpkm"]] <- phylist_plasmids[["phy_logrpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_system_rpkm"]] <- phylist_plasmids[["phy_system_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_systems_rpkm"]] <- phylist_plasmids[["phy_systems_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_rep_rpkm"]] <- phylist_plasmids[["phy_rep_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_relaxase_rpkm"]] <- phylist_plasmids[["phy_relaxase_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_mpf_rpkm"]] <- phylist_plasmids[["phy_mpf_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_orit_rpkm"]] <- phylist_plasmids[["phy_orit_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_mobility_rpkm"]] <- phylist_plasmids[["phy_mobility_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_cluster_type_rpkm"]] <- phylist_plasmids[["phy_cluster_type_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_circularity_rpkm"]] <- phylist_plasmids[["phy_circularity_rpkm"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_AMR"]] <- phylist_plasmids[["phy_AMR"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+# phylist_plasmids[["phy_count_COG20"]] <- phylist_plasmids[["phy_count_COG20"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_rpkm_COG20"]] <- phylist_plasmids[["phy_rpkm_COG20"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+# phylist_plasmids[["phy_logrpkm_COG20"]] <- phylist_plasmids[["phy_logrpkm_COG20"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+# phylist_plasmids[["phy_count_pfam"]] <- phylist_plasmids[["phy_count_pfam"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+phylist_plasmids[["phy_rpkm_pfam"]] <- phylist_plasmids[["phy_rpkm_pfam"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+# phylist_plasmids[["phy_logrpkm_pfam"]] <- phylist_plasmids[["phy_logrpkm_pfam"]] %>% subset_samples(!SubjectID %in% eliminate_mycobiome)
+
+
+
+# Recalculate distance matrices with Bray-Curtis
+phylist_plasmids[["dist"]] <- bcdist(as.matrix(data.frame(otu_table(phylist_plasmids[["phy_rpkm"]]))) %>% t())
+phylist_plasmids[["dist_tree"]] <- hclust(phylist_plasmids[["dist"]], method = "complete")
+
+
+colors <- list(disease = c("Healthy" = "#7AD151FF", "UC" = "#FDE725FF", "CD" = "#414487FF"), 
+               project = c("POP" = "#46F884FF", "IBD Validation" = "#F05B12FF", "Longitudinal Mycobiome" = "#3E9BFEFF"),
+               gender = c("m" = "#395D9CFF", "f" = "#60CEACFF"), 
+               circularity = c("#FCA50AFF", "#932667FF"), 
+               only_complete = c("all" = "#FFEA46FF", "only_complete" = "#31446BFF"), 
+               general_palette_other = c(viridis_pal(option = "H", begin = 0.3, end = 0.1, direction = 1)(3), 
+                                         viridis_pal(direction = 1)(10), viridis_pal(option = "C", direction = -1)(10), 
+                                         viridis_pal(option = "H", begin = 1, end = 0.77)(3), "#BEBEBE" ),
+               general_palette = c(viridis_pal(option = "H", begin = 0.3, end = 0.1, direction = 1)(3), 
+                                   viridis_pal(direction = 1)(10), viridis_pal(option = "C", direction = -1)(10), 
+                                   viridis_pal(option = "H", begin = 1, end = 0.77)(3)),
+               sensitivity = c("passed" = "black", "failed" = "#606060", "struc_zero" = "red"))
+
+```
+
+
+# Exploratory plots
+
+## Samples
+```{r}
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Study", vary = "n_reads", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Study", vary = "Weight", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Study", vary = "Height", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Study", vary = "Age", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Study", vary = "BMI_value", palette = viridis(n = 3))
+
+boxplot_from_physeq(phylist_plasmids$phy_count, varx = "Study", vary = "n_reads", palette = viridis(n = 3))
+
+ggplot(data.frame(sample_data(phylist_plasmids$phy_count)), 
+       mapping = aes(x = Study, fill = factor(BMI, levels = c("obesity", "overweight", "healthy weight", "underweight")))) +
+  geom_bar(position = "fill") + theme_minimal() +
+  scale_fill_viridis(discrete = T, name = "BMI")
+
+ggplot(data.frame(sample_data(phylist_plasmids$phy_count)), 
+       mapping = aes(x = Disease, fill = factor(BMI, levels = c("obesity", "overweight", "healthy weight", "underweight")))) +
+  geom_bar(position = "fill") + theme_minimal() +
+  scale_fill_viridis(discrete = T, name = "BMI")
+
+ggplot(data.frame(sample_data(phylist_plasmids$phy_count)), 
+       mapping = aes(x = Study, fill = Gender)) +
+  geom_bar(position = "fill") + theme_minimal() + 
+  scale_fill_manual(values = colors[["gender"]])
+
+
+```
+
+## Plasmid quantity
+
+```{r}
+summed_plasmids <- otu_table(phylist_plasmids[["phy_rpkm"]]) %>% data.frame() %>% as.matrix() %>% apply(MARGIN = 2, FUN = sum)
+
+phylist_plasmids[["phy_rpkm"]]@sam_data$summed_plasmid_rpkm <- summed_plasmids[rownames(phylist_plasmids[["phy_rpkm"]]@sam_data)]
+
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Disease", vary = "summed_plasmid_rpkm", palette = viridis(n = 3))
+
+
+summed_plasmids_oc <- otu_table(phylist_plasmids_only_complete[["phy_rpkm"]]) %>% data.frame() %>% as.matrix() %>% apply(MARGIN = 2, FUN = sum)
+
+phylist_plasmids_only_complete[["phy_rpkm"]]@sam_data$summed_plasmid_rpkm <- 
+  summed_plasmids_oc[rownames(phylist_plasmids_only_complete[["phy_rpkm"]]@sam_data)]
+
+boxplot_from_physeq(phylist_plasmids_only_complete[["phy_rpkm"]], varx = "Disease", vary = "summed_plasmid_rpkm", palette = viridis(n = 3))
+```
+
+
+## Plasmids
+
+```{r}
+plasmids_data <- data.frame(tax_table(phylist_plasmids[["phy_count"]]))
+plasmids_data$Length <- as.numeric(plasmids_data$Length)
+
+ggplot(data = plasmids_data, mapping = aes(x = Length, fill = Circularity)) + geom_density(alpha = 0.5)  + theme_minimal() + 
+  labs(title = "Length distribution") + scale_x_log10(labels = scales::comma) 
+
+ggplot(data = plasmids_data, mapping = aes(x = Length, fill = predicted_mobility)) + geom_density(alpha = 0.5)  + theme_minimal() + 
+  labs(title = "Length distribution") + scale_x_log10(labels = scales::comma) 
+
+ggplot(data = plasmids_data, mapping = aes(x = as.numeric(PlasX_Score), fill = predicted_mobility)) + geom_density(alpha = 0.5)  + theme_minimal() + 
+  labs(title = "PlasX score distribution") + scale_x_log10(labels = scales::comma) 
+
+ggplot(data = plasmids_data, mapping = aes(x = Length, fill = cluster_type)) + geom_density(alpha = 0.5)  + theme_minimal() + 
+  labs(title = "Length distribution") + scale_x_log10(labels = scales::comma) 
+
+```
+
+
+# Heatmap
+```{r}
+
+heatmap_rpkm <- plot_rpkm_heatmap(phy = phylist_plasmids$phy_logrpkm, cluster_rows = phylist_plasmids$dist_tree, 
+                  rowside_vars = c("Disease", "Gender"), 
+                  rowside_cols = list(Disease = colors$disease,
+                                      Gender = colors$gender),
+                  # colside_vars = c("Circularity"),
+                  # colside_cols = list(Circularity = colors$circularity),
+                  row_title = paste0(nrow(sample_data(phylist_plasmids$phy_logrpkm)), " samples"), 
+                  col_title = paste0(nrow(tax_table(phylist_plasmids$phy_logrpkm)), " plasmids"), row_dend_width = 0.1, 
+                  )
+
+
+heatmap_rpkm
+
+```
+
+
+# Coverage heatmap 
+(detection)
+```{r}
+
+
+heatmap_cov <- plot_coverage_heatmap(phy = phylist_plasmids$phy_logrpkm,
+                                  cov_matrix = phylist_plasmids$coverage_matrix,
+                                  cluster_rows = phylist_plasmids$dist_tree, 
+                  rowside_vars = c("Project" = "Study", "Disease", "Gender"), 
+                  rowside_cols = list("Project" = colors$project,
+                                      Disease = colors$disease,
+                                      Gender = colors$gender),
+                  # colside_vars = c("Circularity"),
+                  # colside_cols = list(Circularity = colors$circularity),
+                  row_title = paste0(nrow(sample_data(phylist_plasmids$phy_logrpkm)), " samples"), 
+                  col_title = paste0(nrow(tax_table(phylist_plasmids$phy_logrpkm)), " plasmids"), row_dend_width = 0.1
+                  )
+
+heatmap_cov_oc <- plot_coverage_heatmap(phy = phylist_plasmids_only_complete$phy_logrpkm,
+                                         cov_matrix = phylist_plasmids_only_complete$coverage_matrix, 
+                                         cluster_rows = phylist_plasmids_only_complete$dist_tree,
+                  rowside_vars = c("Project" = "Study", "Disease", "Gender"), 
+                  rowside_cols = list("Project" = colors$project,
+                                      Disease = colors$disease,
+                                      Gender = colors$gender),
+                  # colside_vars = c("Circularity"),
+                  # colside_cols = list(Circularity = colors$circularity),
+                  row_title = paste0(nrow(sample_data(phylist_plasmids_only_complete$phy_logrpkm)), " samples"), 
+                  col_title = paste0(nrow(tax_table(phylist_plasmids_only_complete$phy_logrpkm)), " plasmids"), row_dend_width = 0.1
+                  )
+
+heatmap_cov
+heatmap_cov_oc
+
+```
+
+# Rel abundance
+
+## All plasmids
+
+Relative abundance of plasmid systems/replicases/etc
+```{r}
+
+# At the plasmid level: 
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_rpkm"]], facet_condition = "Disease", top_func = sum,
+                     taxonomic_rank = "Plasmid_ID", plotlegend = T, n = 10, tax_glom_done = T, palette = colors$general_palette_other) + 
+  guides(fill = guide_legend(ncol = 1)) 
+
+# At the plasmid system level:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_system_rpkm"]], facet_condition = "Disease", top_func = sum, drop_none = F,
+                     taxonomic_rank = "system", plotlegend = T, n = 20, tax_glom_done = T, 
+                     legend_label = "Plasmid system", palette = colors$general_palette_other)  + 
+  guides(fill = guide_legend(ncol = 1)) 
+
+# At the plasmid systems level:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_systems_rpkm"]], facet_condition = "Disease", top_func = sum, drop_none = F,
+                     taxonomic_rank = "systems", plotlegend = T, n = 20, tax_glom_done = T, 
+                     legend_label = "Plasmid systems", palette = colors$general_palette_other)  + 
+  guides(fill = guide_legend(ncol = 1)) 
+
+# Replicase:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_rep_rpkm"]], facet_condition = "Disease", top_func = sum, drop_none = F,
+                         taxonomic_rank = "rep_type.s.", plotlegend = T, n = 40, tax_glom_done = T, 
+                         legend_label = "Plasmid rep type", palette = colors$general_palette_other)  +
+  guides(fill = guide_legend(ncol = 1)) + coord_cartesian(ylim = c(0, 0.15))
+
+# Relaxase:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_relaxase_rpkm"]], facet_condition = "Disease", top_func = sum, drop_none = F,
+                         taxonomic_rank = "relaxase_type.s.", plotlegend = T, n = 40, tax_glom_done = T, 
+                         legend_label = "Plasmid relaxase type", palette = colors$general_palette)  +
+  guides(fill = guide_legend(ncol = 1)) + coord_cartesian(ylim = c(0, 0.15))
+
+# MPF:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_mpf_rpkm"]], facet_condition = "Disease", top_func = sum, drop_none = F,
+                         taxonomic_rank = "mpf_type", plotlegend = T, n = 40, tax_glom_done = T, legend_label = "mpf type", 
+                         palette = colors$general_palette)  +
+  guides(fill = guide_legend(ncol = 1)) + coord_cartesian(ylim = c(0, 0.05))
+
+# OriT:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_orit_rpkm"]], facet_condition = "Disease", top_func = sum, drop_none = F,
+                         taxonomic_rank = "orit_type.s.", plotlegend = T, n = 40, tax_glom_done = T, legend_label = "OriT type", 
+                         palette = colors$general_palette)  +
+  guides(fill = guide_legend(ncol = 1)) + coord_cartesian(ylim = c(0, 0.05))
+
+# Mobility:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_mobility_rpkm"]], facet_condition = "Disease", top_func = sum,
+                         taxonomic_rank = "predicted_mobility", plotlegend = T, n = 40, tax_glom_done = T, 
+                         legend_label = "Plasmid mobility", palette = colors$general_palette)  +
+  guides(fill = guide_legend(ncol = 1)) 
+
+# Cluster type:
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_cluster_type_rpkm"]], facet_condition = "Disease", top_func = sum,
+                         taxonomic_rank = "cluster_type", plotlegend = T, n = 40, tax_glom_done = T, 
+                         legend_label = "Plasmid cluster type", palette = colors$general_palette)  +
+  guides(fill = guide_legend(ncol = 1)) 
+
+# Circularity
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_circularity_rpkm"]], facet_condition = "Disease", top_func = sum,
+                         taxonomic_rank = "Circularity", plotlegend = T, tax_glom_done = T, 
+                         legend_label = "Plasmid circularity", palette = colors$general_palette)  +
+  guides(fill = guide_legend(ncol = 1)) 
+
+
+# AMR
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_AMR"]], facet_condition = "Disease", top_func = sum,
+                         taxonomic_rank = "ARG", plotlegend = T, tax_glom_done = T, 
+                         legend_label = "AMR", palette = colors$general_palette)  +
+  guides(fill = guide_legend(ncol = 1))  + coord_cartesian(ylim = c(0, 0.05))
+
+taxtable_genes <- phylist_plasmids[["phy_rpkm_COG20"]]@tax_table %>% data.frame() 
+taxtable_genes$name <- str_extract(taxtable_genes$function., "\\((\\w+)\\)") %>% str_remove_all("[()]")
+taxtable_genes[duplicated(taxtable_genes$name), "name"] <- paste0(taxtable_genes[duplicated(taxtable_genes$name), "name"], 
+                                                                  runif(n = length(taxtable_genes[duplicated(taxtable_genes$name), "name"]),
+                                                                        min = 1, max = 999)) 
+taxtable_genes[is.na(taxtable_genes$name), "name"] <- paste0(taxtable_genes[is.na(taxtable_genes$name), "name"], 
+                                                                  runif(n = length(taxtable_genes[is.na(taxtable_genes$name), "name"]),
+                                                                        min = 1, max = 999)) 
+taxtable_genes["COG4646", "name"] <- "Adenine-specific_DNA_methylase"
+taxtable_genes["COG3436", "name"] <- "Transposase_"
+taxtable_genes["COG5527", "name"] <- "RepE"
+taxtable_genes["COG3547", "name"] <- "Transposase__"
+taxtable_genes["COG4115", "name"] <- "Txe-Axe_Toxin"
+taxtable_genes["COG4372", "name"] <- "Uncharacterized_protein"
+taxtable_genes["COG4584", "name"] <- "Transposase___"
+taxtable_genes["COG5545", "name"] <- "P-loop_ATPase"
+taxtable_genes["COG3378", "name"] <- "DNA_primase"
+taxtable_genes["COG3666", "name"] <- "IS1182_transposase"
+
+
+# Genes?
+taxa_plot <- plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_rpkm_COG20"]] %>% merge_phyloseq(tax_table(as.matrix(taxtable_genes))), 
+                         facet_condition = F, top_func = sum, facet_space = "free",
+                         taxonomic_rank = "name", plotlegend = T, tax_glom_done = T, n = 49, non_unique = F,
+                         legend_label = "COG20", palette = colors$general_palette_other)  +
+  guides(fill = guide_legend(ncol = 5, nrow = 10, position = "bottom", title = NULL)) 
+
+ggsave(filename = "/home/arnau/Desktop/TFM Figures/1C.png", plot = taxa_plot, width = 2500, height = 3000, scale = 1.2, dpi = 300, units = "px")
+```
+
+
+# Gene content 
+```{r}
+phylist_plasmids[["annotation"]] %>% filter(Plasmid_ID %in% rownames(phylist_plasmids[["phy_count"]]@tax_table), source.y == "COG20_FUNCTION") %>% group_by(accession, function.) %>% summarise(n_plasmids = n()) %>% arrange(desc(n_plasmids)) %>%
+  write.table("BASE_DIR/PLASMIDOME_results/gene_content.tsv", sep = "\t", row.names = F, col.names = c("COG20 accession", "Function", "Number of plasmids"))
+```
+
+
+
+
+# AMR
+
+```{r}
+resistance_rpkm <- (otu_table(phylist_plasmids[["phy_AMR"]]) %>% data.frame() %>% as.matrix())["TRUE",]
+
+phylist_plasmids[["phy_rpkm"]]@sam_data$resistance_rpkm <- resistance_rpkm[rownames(phylist_plasmids[["phy_rpkm"]]@sam_data)]
+
+boxplot_from_physeq(phylist_plasmids[["phy_rpkm"]], varx = "Disease", vary = "resistance_rpkm", palette = viridis(n = 3))
+```
+
+
+# PcoA
+```{r}
+
+pcoa_results <- pcoa(phylist_plasmids[["dist"]])
+pcoa_table <- cbind(sample_data(phylist_plasmids$phy_count),
+                    as.data.frame(pcoa_results$vectors)[rownames(sample_data(phylist_plasmids$phy_count)),])
+phylist_plasmids[["pcoa_table"]] <- pcoa_table
+phylist_plasmids[["pcoa_results"]] <- pcoa_results
+
+pcoa_results_oc <- pcoa(phylist_plasmids_only_complete[["dist"]])
+pcoa_table_oc <- cbind(sample_data(phylist_plasmids_only_complete$phy_count),
+                    as.data.frame(pcoa_results_oc$vectors)[rownames(sample_data(phylist_plasmids_only_complete$phy_count)),])
+phylist_plasmids_only_complete[["pcoa_table"]] <- pcoa_table_oc
+phylist_plasmids_only_complete[["pcoa_results"]] <- pcoa_results_oc
+
+```
+
+Plots
+```{r}
+
+plot_pcoa(pcoa_table = phylist_plasmids[["pcoa_table"]], pcoa_results = phylist_plasmids[["pcoa_results"]], colorvar = "Disease", 
+          shapevar = "Study", palette = colors[["disease"]], ellipse = T)
+
+plot_pcoa(pcoa_table = phylist_plasmids_only_complete[["pcoa_table"]], pcoa_results = phylist_plasmids_only_complete[["pcoa_results"]], 
+          colorvar = "Disease", shapevar = "Study", palette = colors[["disease"]], ellipse = T)
+
+
+# Scree plots: 
+scree_plot(phylist_plasmids[["pcoa_results"]], num = 20, color = colors[["only_complete"]]["all"])
+scree_plot(phylist_plasmids_only_complete[["pcoa_results"]], num = 20, color = colors[["only_complete"]]["only_complete"])
+
+```
+
+# UMAP
+```{r}
+
+
+plot_umap(phy_rpkm = phylist_plasmids[["phy_rpkm"]], n_neighbors = 20, colorvar = "Disease", shapevar = "Study",
+          palette = colors[["disease"]], ellipse = T)
+
+plot_umap(phy_rpkm = phylist_plasmids_only_complete[["phy_rpkm"]], n_neighbors = 20, colorvar = "Disease", shapevar = "Study",
+          palette = colors[["disease"]], ellipse = T)
+
+
+```
+
+# pBI143: HCPOP_0155_000000008383, HCPOP_0189_000000041952, HCPOP_235_000000008271, VH_CD_030B_000000000860
+```{r}
+pBI143_plasmids <- c('HCPOP_0007_000000036412','HCPOP_0033_000000008490','HCPOP_0066_000000047820','HCPOP_0088_000000010274','HCPOP_0097_000000006396','HCPOP_0102_000000017992','HCPOP_0116_000000037096','HCPOP_0119_000000010827','HCPOP_0129_000000026456','HCPOP_0155_000000008383','HCPOP_0159_000000002291','HCPOP_0165_000000000675','HCPOP_0189_000000041952','HCPOP_209_000000003020','HCPOP_235_000000008271','HCPOP_236_000000002929','HCPOP_249_000000032198','HCPOP_284_000000008845','HCPOP_314_000000001127','HCPOP_328_000000018647','HCPOP_334_000000006077','HCPOP_355_000000020009','HCPOP_356_000000007456','HCPOP_426_000000015176','HCPOP_452_000000010905','HCPOP_464_000000014772','HCPOP_480_000000026566','HCPOP_481_000000013547','HCPOP_492_000000007997','L2_7C_000000007442','L3_8C_000000020829','L5_3C_000000005828','L6_3C_000000023242','POP9_000000011225','VH_CD_030B_000000000860')
+
+pBI143 <- otu_table(phylist_plasmids[["phy_count"]])[pBI143_plasmids, ] %>% data.frame() 
+pBI143$Plasmid_ID <- rownames(pBI143)
+
+pBI143 <- pivot_longer(pBI143, cols = all_of(sample_data(phylist_plasmids[["phy_rpkm"]])$SubjectID),
+                       names_to = 'SubjectID', values_to = 'pBI143_reads') %>% 
+  left_join(sample_data(phylist_plasmids[["phy_rpkm"]]), by = 'SubjectID') %>% 
+  mutate(percent_pBI143 = pBI143_reads/n_reads * 100)
+
+ggplot(pBI143, mapping = aes(x = Disease, y = log10(percent_pBI143 + 0.0000001), color = Disease)) +
+  geom_boxplot() + theme_minimal() + facet_wrap(~ Plasmid_ID, scales = "free_y") +
+  geom_point(position = "jitter", alpha = 0.3) +
+  scale_color_manual(values = colors[["disease"]])
+
+ggplot(pBI143, mapping = aes(x = Disease, y = log10(percent_pBI143 + 0.0000001), color = Disease)) +
+  geom_violin() + theme_minimal() + facet_wrap(~ Plasmid_ID, scales = "free_y") +
+  geom_point(position = "jitter", alpha = 0.2, size = 0.2) +
+  scale_color_manual(values = colors[["disease"]])
+
+
+
+pBI143 <- phylist_plasmids[["coverage_matrix"]][pBI143_plasmids, ] %>% data.frame() 
+pBI143$Plasmid_ID <- rownames(pBI143)
+
+pBI143 <- pivot_longer(pBI143, cols = all_of(sample_data(phylist_plasmids[["phy_rpkm"]])$SubjectID),
+                       names_to = 'SubjectID', values_to = 'pBI143_cov') %>% 
+  left_join(sample_data(phylist_plasmids[["phy_rpkm"]]), by = 'SubjectID')
+
+ggplot(pBI143, mapping = aes(x = Disease, y = pBI143_cov, color = Disease)) +
+  geom_boxplot() + theme_minimal() + facet_wrap(~ Plasmid_ID, scales = "free_y") +
+  geom_point(position = "jitter", alpha = 0.3) +
+  scale_color_manual(values = colors[["disease"]])
+
+ggplot(pBI143, mapping = aes(x = Disease, y = pBI143_cov, color = Disease)) +
+  geom_violin() + theme_minimal() + facet_wrap(~ Plasmid_ID, scales = "free_y") +
+  geom_point(position = "jitter", alpha = 0.2, size = 0.2) +
+  scale_color_manual(values = colors[["disease"]])
+
+```
+
+
+# Alpha diversity
+
+## Chao1
+```{r}
+chao1_results <- chao1_from_physeq_abs(phy_obj = phylist_plasmids[["phy_count"]], variable = "Disease", palette = colors[["disease"]])
+
+chao1_results$plot
+
+chao1_results_oc <- chao1_from_physeq_abs(phy_obj = phylist_plasmids_only_complete[["phy_count"]], variable = "Disease", palette = colors[["disease"]])
+
+chao1_results_oc$plot
+
+```
+
+## Shannon
+
+```{r}
+shannon_results <- shannon_from_physeq(phy_obj = phylist_plasmids[["phy_rpkm"]], variable = "Disease", palette = colors[["disease"]])
+
+shannon_results$plot
+
+shannon_results_oc <- shannon_from_physeq(phy_obj = phylist_plasmids_only_complete[["phy_rpkm"]], 
+                                          variable = "Disease", palette = colors[["disease"]])
+
+shannon_results_oc$plot
+
+
+shannon_results_genes <- shannon_from_physeq(phy_obj = phylist_plasmids[["phy_rpkm_COG20"]], 
+                                          variable = "Disease", palette = colors[["disease"]])
+
+shannon_results_genes$plot
+```
+
+# Beta diversity 
+
+```{r}
+beta_div <- plot_beta_div(physeq = phylist_plasmids$phy_rpkm, dist = phylist_plasmids$dist, group = "Disease", 
+                          pairwise_adonis = T, add_pval = T)
+
+beta_div_oc <- plot_beta_div(physeq = phylist_plasmids_only_complete$phy_rpkm, dist = phylist_plasmids_only_complete$dist, group = "Disease",
+              pairwise_adonis = T, add_pval = T) 
+
+beta_div$plot
+beta_div_oc$plot
+```
+
+
+
+
+# ANCOM-BC
+
+
+```{r}
+run_ancombc <- function(phyobject, taxa_level){
+  phyobject@sam_data$Disease <- factor(phyobject@sam_data$Disease, levels = c("Healthy", "CD", "UC"))
+  
+  ancom_output <- ancombc2(
+    data = phyobject, taxa_are_rows = T, assay_name = "RPKM", tax_level = taxa_level, rand_formula = NULL,
+    meta_data = sample_data(phyobject), fix_formula = "Disease + Age + Gender + BMI_value",
+    p_adj_method = "BH", pseudo_sens = T, prv_cut = 0.1, lib_cut = 0, s0_perc = 0.15, group = "Disease", struc_zero = T, 
+    neg_lb = T, alpha = 0.05, n_cl = 44, verbose = TRUE, global = F, pairwise  = F, dunnet = FALSE, trend = FALSE, 
+                    iter_control = list(tol = 0.01, max_iter = 20, 
+                                        verbose = FALSE),
+                    em_control = list(tol = 1e-5, max_iter = 100),
+                    lme_control = lme4::lmerControl(),
+                    mdfdr_control = list(fwer_ctrl_method = "holm", B = 100),
+                    trend_control = list(contrast = NULL, node = NULL, solver = "ECOS", B = 100)
+  )
+  
+  return(ancom_output)
+}
+
+
+ancom_output <- run_ancombc(phylist_plasmids[["phy_rpkm"]], taxa_level = "Plasmid_ID")
+ancom_output_oc <- run_ancombc(phylist_plasmids_only_complete[["phy_rpkm"]], taxa_level = "Plasmid_ID")
+ancom_output_system <- run_ancombc(phylist_plasmids[["phy_system_rpkm"]], taxa_level = "system")
+ancom_output_systems <- run_ancombc(phylist_plasmids[["phy_systems_rpkm"]], taxa_level = "systems")
+ancom_output_rep <- run_ancombc(phylist_plasmids[["phy_rep_rpkm"]], taxa_level = "rep_type.s.")
+ancom_output_relaxase <- run_ancombc(phylist_plasmids[["phy_relaxase_rpkm"]], taxa_level = "relaxase_type.s.")
+ancom_output_mpf <- run_ancombc(phylist_plasmids[["phy_mpf_rpkm"]], taxa_level = "mpf_type")
+ancom_output_orit <- run_ancombc(phylist_plasmids[["phy_orit_rpkm"]], taxa_level = "orit_type.s.")
+ancom_output_COG20 <- run_ancombc(phylist_plasmids[["phy_rpkm_COG20"]], taxa_level = "accession")
+ancom_output_pfam <- run_ancombc(phylist_plasmids[["phy_rpkm_pfam"]], taxa_level = "accession")
+
+save(ancom_output, ancom_output_oc, ancom_output_system, ancom_output_systems, 
+     ancom_output_rep, ancom_output_relaxase, ancom_output_mpf, ancom_output_orit, ancom_output_COG20, ancom_output_pfam,
+     file = 'BASE_DIR/ancom_plasmids.RData')
+```
+
+## Load results
+```{r}
+load("BASE_DIR/ancom_plasmids.RData")
+```
+
+## Process
+
+```{r}
+process_ancombc_res <- function(ancom_output){
+  res_prim <- ancom_output$res
+  res_res <- res_prim %>% select(taxon, names(res_prim)[names(res_prim) %>% endsWith(c("CD","UC"))]) %>%
+    #reshape the data so each lfc_CD and lfc_UC columns, etc. get put into 1 column (so two rows per taxon, one for CD and one for UC)
+    pivot_longer(cols = -taxon, # keep taxon column as is
+                 names_to = c(".value", "Disease"), # split column names into (column name) (Disease)
+                 names_pattern = "(.*)_(DiseaseCD|DiseaseUC)" #extract name and disease with regex
+                 ) %>%
+    mutate(Disease = ifelse(Disease == "DiseaseCD", "CD", "UC")) %>% # Rename Disease values 
+    data.frame()
+  return(res_res)
+}
+
+process_struc_zeros <- function(ancom_output){
+  res_struc_zeros <- ancom_output$zero_ind %>% rename(sz_healthy = `structural_zero (Disease = Healthy)`, 
+                                                      sz_CD = `structural_zero (Disease = CD)`, sz_UC = `structural_zero (Disease = UC)`)
+}
+
+res_plasmids <- process_ancombc_res(ancom_output)
+res_plasmids_oc <- process_ancombc_res(ancom_output_oc)
+res_system <- process_ancombc_res(ancom_output_system)
+res_systems <- process_ancombc_res(ancom_output_systems)
+res_rep <- process_ancombc_res(ancom_output_rep)
+res_relaxase <- process_ancombc_res(ancom_output_relaxase)
+res_mpf <- process_ancombc_res(ancom_output_mpf)
+res_orit <- process_ancombc_res(ancom_output_orit)
+res_COG20 <- process_ancombc_res(ancom_output_COG20)
+res_pfam <- process_ancombc_res(ancom_output_pfam)
+
+res_struc_zeros <- process_struc_zeros(ancom_output)
+res_struc_zeros_oc <- process_struc_zeros(ancom_output_oc)
+res_struc_zeros_system <- process_struc_zeros(ancom_output_system)
+res_struc_zeros_systems <- process_struc_zeros(ancom_output_systems)
+res_struc_zeros_rep <- process_struc_zeros(ancom_output_rep)
+res_struc_zeros_relaxase <- process_struc_zeros(ancom_output_relaxase)
+res_struc_zeros_mpf <- process_struc_zeros(ancom_output_mpf)
+res_struc_zeros_orit <- process_struc_zeros(ancom_output_orit)
+res_struc_zeros_COG20 <- process_struc_zeros(ancom_output_COG20)
+res_struc_zeros_pfam <- process_struc_zeros(ancom_output_pfam)
+```
+
+
+### P-value dist
+```{r}
+p_value_distribution <- function(res_plasmids, disease, comparison){
+  res_perm <- res_plasmids %>% filter(Disease == disease) %>%
+    dplyr::transmute(taxon = taxon,
+                     p = `p`,
+                     ss_pass = `passed_ss`) %>%
+  rowwise() %>%
+  mutate(
+      p_update = case_when(
+          # For taxa with significant p-values that failed the sensitivity analysis,
+          # we assign a random value uniformly drawn from the range [0.05, 1].
+          p < 0.05 & ss_pass == FALSE ~ runif(1, min = 0.05, max = 1),
+    TRUE ~ p 
+  )) %>%
+  ungroup()
+
+  df_p = res_perm %>%
+    dplyr::select(p, p_update) %>%
+    pivot_longer(cols = p:p_update, names_to = "type", values_to = "value") 
+  df_p$type = recode(df_p$type, 
+                     `p` = "ANCOM-BC2 (Without Sensitivity Analysis)", 
+                     `p_update` = "ANCOM-BC2 (With Sensitivity Analysis)")
+  
+  num_bins = 30
+  fig_p = df_p %>%
+    ggplot(aes(x = value, fill = type)) +
+    geom_histogram(position = "identity", alpha = 0.5, bins = num_bins) +
+    geom_hline(yintercept = nrow(res_perm)/num_bins, linetype = "dashed") +
+    theme_minimal() +
+    labs(title = paste0("Distribution of P-values (", comparison, " - ", disease, ")"),
+         x = "P-value",
+         y = "Frequency",
+         fill = NULL,
+         color = NULL) +
+      theme_bw() + 
+      theme(plot.title = element_text(hjust = 0.5),
+            panel.grid.minor.y = element_blank(),
+            legend.position = "bottom")
+  return(fig_p)
+}
+
+
+p_value_distribution(res_plasmids, "CD", "plasmid")
+p_value_distribution(res_plasmids, "UC", "plasmid")
+p_value_distribution(res_plasmids_oc, "CD", "complete plasmid")
+p_value_distribution(res_plasmids_oc, "UC", "complete plasmid")
+p_value_distribution(res_system, "CD", "plasmid system")
+p_value_distribution(res_system, "UC", "plasmid system")
+p_value_distribution(res_systems, "CD", "plasmid systems")
+p_value_distribution(res_systems, "UC", "plasmid systems")
+p_value_distribution(res_rep, "CD", "rep")
+p_value_distribution(res_rep, "UC", "rep")
+p_value_distribution(res_relaxase, "CD", "relaxase")
+p_value_distribution(res_relaxase, "UC", "relaxase")
+p_value_distribution(res_mpf, "CD", "MPF")
+p_value_distribution(res_mpf, "UC", "MPF")
+p_value_distribution(res_orit, "CD", "oriT")
+p_value_distribution(res_orit, "UC", "oriT")
+p_value_distribution(res_COG20, "CD", "accession")
+p_value_distribution(res_COG20, "UC", "accession")
+p_value_distribution(res_pfam, "CD", "accession")
+p_value_distribution(res_pfam, "UC", "accession")
+
+```
+
+## Volcano plot
+```{r}
+volcano_plot_ancombc <- function(res_ancombc, disease, title, colorspecial = NULL){
+  res_ancombc %>% filter(Disease == disease) %>%
+    mutate(color_var = case_when(q > 0.05 ~ "NS", passed_ss == F ~ "ss", 
+                                 taxon %in% colorspecial ~ "special", # Just in cas I want to color AMR genes
+                                 lfc > 0 ~ "Up", lfc < 0 ~ "Down"), 
+           label = ifelse(q <= 0.05 & passed_ss == T, taxon, NA)) %>%
+    ggplot(mapping = aes(x = lfc, y = -log10(q), color = color_var)) +
+      geom_point(alpha = 0.75) + 
+      geom_abline(slope = 0, intercept = -log10(0.05)) +
+      geom_text_repel(aes(label = label), max.overlaps = 10, size = 3, na.rm = T) + 
+      theme_minimal() + 
+      scale_color_manual(values = c("Down" = "blue2", "Up" = "red1", "NS" = "#808080", "ss" = "#A0A0A0", "special" = "green"), name = "") +
+      xlab("log FC") + ggtitle(paste0(disease, " vs Healthy - ", title))
+}
+
+volcano_plot_ancombc(res_plasmids, "CD", "plasmid differential abundance", 
+                     colorspecial = phylist_plasmids[["phy_rpkm"]]@tax_table %>% data.frame() %>% filter(!is.na(ARG)) %>% pull("Plasmid_ID"))
+volcano_plot_ancombc(res_plasmids, "UC", "plasmid differential abundance", 
+                     colorspecial = phylist_plasmids[["phy_rpkm"]]@tax_table %>% data.frame() %>% filter(!is.na(ARG)) %>% pull("Plasmid_ID"))
+volcano_plot_ancombc(res_plasmids_oc, "CD", "plasmid differential abundance (oc)")
+volcano_plot_ancombc(res_plasmids_oc, "UC", "plasmid differential abundance (oc)")
+volcano_plot_ancombc(res_system, "CD", "plasmid system differential abundance")
+volcano_plot_ancombc(res_system, "UC", "plasmid system differential abundance")
+volcano_plot_ancombc(res_systems, "CD", "plasmid systems differential abundance")
+volcano_plot_ancombc(res_systems, "UC", "plasmid systems differential abundance")
+volcano_plot_ancombc(res_rep, "CD", "rep differential abundance")
+volcano_plot_ancombc(res_rep, "UC", "rep differential abundance")
+volcano_plot_ancombc(res_relaxase, "CD", "relaxase differential abundance")
+volcano_plot_ancombc(res_relaxase, "UC", "relaxase differential abundance")
+volcano_plot_ancombc(res_mpf, "CD", "mpf differential abundance")
+volcano_plot_ancombc(res_mpf, "UC", "mpf differential abundance")
+volcano_plot_ancombc(res_orit, "CD", "oriT differential abundance")
+volcano_plot_ancombc(res_orit, "UC", "oriT differential abundance")
+volcano_plot_ancombc(res_COG20, "CD", "COG20 differential abundance")
+volcano_plot_ancombc(res_COG20, "UC", "COG20 differential abundance")
+volcano_plot_ancombc(res_pfam, "CD", "Pfam differential abundance")
+volcano_plot_ancombc(res_pfam, "UC", "Pfam differential abundance")
+
+
+res_COG20 %>% filter(Disease == "CD") %>%
+    mutate(color_var = case_when(q > 0.05 ~ "NS", passed_ss == F ~ "ss", lfc > 0 ~ "Up", lfc < 0 ~ "Down")) %>% 
+    left_join(phylist_plasmids[["phy_rpkm_COG20"]]@tax_table %>% data.frame() %>% select(accession, function.), 
+              by = c("taxon" = "accession")) %>%
+    mutate(label = ifelse(q <= 0.05 & passed_ss == T, function., NA)) %>%
+    ggplot(mapping = aes(x = lfc, y = -log10(q), color = color_var)) +
+      geom_point(alpha = 0.75) + 
+      geom_abline(slope = 0, intercept = -log10(0.05)) +
+      geom_text_repel(aes(label = label), max.overlaps = 20, size = 2, na.rm = T, show.legend = F) + 
+      theme_minimal() + 
+      scale_color_manual(values = c("Down" = "blue2", "Up" = "red1", "NS" = "#808080", "ss" = "#A0A0A0"), name = "") +
+      xlab("log FC") + ggtitle(paste0("CD", " vs Healthy - ", "COG20 differential abundance"))
+
+
+res_COG20 %>% filter(Disease == "UC") %>%
+    mutate(color_var = case_when(q > 0.05 ~ "NS", passed_ss == F ~ "ss", lfc > 0 ~ "Up", lfc < 0 ~ "Down")) %>% 
+    left_join(phylist_plasmids[["phy_rpkm_COG20"]]@tax_table %>% data.frame() %>% select(accession, function.), 
+              by = c("taxon" = "accession")) %>%
+    mutate(label = ifelse(q <= 0.05 & passed_ss == T, function., NA)) %>%
+    ggplot(mapping = aes(x = lfc, y = -log10(q), color = color_var)) +
+      geom_point(alpha = 0.75) + 
+      geom_abline(slope = 0, intercept = -log10(0.05)) +
+      geom_text_repel(aes(label = label), max.overlaps = 20, size = 2, na.rm = T, show.legend = F) + 
+      theme_minimal() + 
+      scale_color_manual(values = c("Down" = "blue2", "Up" = "red1", "NS" = "#808080", "ss" = "#A0A0A0"), name = "") +
+      xlab("log FC") + ggtitle(paste0("UC", " vs Healthy - ", "COG20 differential abundance"))
+
+res_pfam %>% filter(Disease == "CD") %>%
+    mutate(color_var = case_when(q > 0.05 ~ "NS", passed_ss == F ~ "ss", lfc > 0 ~ "Up", lfc < 0 ~ "Down")) %>% 
+    left_join(phylist_plasmids[["phy_rpkm_pfam"]]@tax_table %>% data.frame() %>% select(accession, function.), 
+              by = c("taxon" = "accession")) %>%
+    mutate(label = ifelse(q <= 0.05 & passed_ss == T, function., NA)) %>%
+    ggplot(mapping = aes(x = lfc, y = -log10(q), color = color_var)) +
+      geom_point(alpha = 0.75) + 
+      geom_abline(slope = 0, intercept = -log10(0.05)) +
+      geom_text_repel(aes(label = label), max.overlaps = 20, size = 2, na.rm = T, show.legend = F) + 
+      theme_minimal() + 
+      scale_color_manual(values = c("Down" = "blue2", "Up" = "red1", "NS" = "#808080", "ss" = "#A0A0A0"), name = "") +
+      xlab("log FC") + ggtitle(paste0("CD", " vs Healthy - ", "Pfam differential abundance"))
+
+
+res_pfam %>% filter(Disease == "UC") %>%
+    mutate(color_var = case_when(q > 0.05 ~ "NS", passed_ss == F ~ "ss", lfc > 0 ~ "Up", lfc < 0 ~ "Down")) %>% 
+    left_join(phylist_plasmids[["phy_rpkm_pfam"]]@tax_table %>% data.frame() %>% select(accession, function.), 
+              by = c("taxon" = "accession")) %>%
+    mutate(label = ifelse(q <= 0.05 & passed_ss == T, function., NA)) %>%
+    ggplot(mapping = aes(x = lfc, y = -log10(q), color = color_var)) +
+      geom_point(alpha = 0.75) + 
+      geom_abline(slope = 0, intercept = -log10(0.05)) +
+      geom_text_repel(aes(label = label), max.overlaps = 20, size = 2, na.rm = T, show.legend = F) + 
+      theme_minimal() + 
+      scale_color_manual(values = c("Down" = "blue2", "Up" = "red1", "NS" = "#808080", "ss" = "#A0A0A0"), name = "") +
+      xlab("log FC") + ggtitle(paste0("UC", " vs Healthy - ", "Pfam differential abundance"))
+```
+
+
+## logFC heatmap
+```{r}
+
+fc_boxplot <- function(res_plasmids, res_struc_zeros, struc_0 = F, keep_failed = T){
+  res_sig <- res_plasmids %>% filter(diff == TRUE) %>% 
+    mutate(color = ifelse(passed_ss == TRUE, colors[["sensitivity"]]["passed"], colors[["sensitivity"]]["failed"]))
+  
+  if (struc_0) {
+  # Add structural 0s data if desired
+  res_sig_zeroes <- res_struc_zeros %>% pivot_longer(cols = c("sz_CD", "sz_UC"), names_to = "Disease", values_to = "sz_Disease", 
+                                   names_prefix = "sz_") %>% filter(sz_healthy != sz_Disease) %>% data.frame() %>%
+                                          # if 0 in Healthy, then it's positive FC in disease
+    mutate(lfc = case_when(Disease == "CD" & sz_healthy == T ~ max(res_sig %>% filter(Disease == "CD") %>% pull(lfc)),
+                           Disease == "CD" & sz_healthy == F ~ min(res_sig %>% filter(Disease == "CD") %>% pull(lfc)),
+                           Disease == "UC" & sz_healthy == T ~ max(res_sig %>% filter(Disease == "UC") %>% pull(lfc)),
+                           Disease == "UC" & sz_healthy == F ~ min(res_sig %>% filter(Disease == "UC") %>% pull(lfc))
+                           ),
+           se = NA, W = NA, p = 0, q = 0, diff = TRUE, passed_ss = TRUE, color = colors[["sensitivity"]]["struc_zero"]) %>% 
+    select(all_of(names(res_sig)))
+  
+  res_sig <- rbind(res_sig, res_sig_zeroes)
+  }
+  if (!keep_failed){
+    #remove results that failed the sensitivity analysis if specified
+    res_sig <- res_sig %>% filter(passed_ss == T)
+  }
+  
+  res_sig <- res_sig %>% arrange(lfc) %>% mutate(q_plot = round(q, digits = 3))
+  res_sig$taxon <- factor(res_sig$taxon, levels = unique(res_sig$taxon))
+  
+  lo <- floor(min(res_sig$lfc))
+  up <- ceiling(max(res_sig$lfc))
+  mid <- 0
+  fig <- res_sig %>% ggplot(aes(x = Disease, y = taxon, fill = lfc)) + 
+    geom_tile() +
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                         na.value = "white", midpoint = mid, limit = c(lo, up),
+                         name = NULL) +
+    geom_text(aes(Disease, taxon, label = q_plot, color = color), size = 4) +
+      scale_color_identity(guide = "none") +
+    labs(x = NULL, y = NULL, title = "Log fold changes as compared to healthy") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  return(fig)
+}
+
+
+fc_boxplot(res_plasmids, res_struc_zeros, struc_0 = F, keep_failed = F)
+fc_boxplot(res_plasmids_oc, res_struc_zeros_oc, struc_0 = F, keep_failed = F)
+fc_boxplot(res_system, res_struc_zeros_system, struc_0 = F, keep_failed = F)
+fc_boxplot(res_systems, res_struc_zeros_systems, struc_0 = F, keep_failed = F)
+fc_boxplot(res_rep, res_struc_zeros_rep, struc_0 = F, keep_failed = F)
+fc_boxplot(res_relaxase, res_struc_zeros_relaxase, struc_0 = F, keep_failed = F)
+fc_boxplot(res_mpf, res_struc_zeros_mpf, struc_0 = F, keep_failed = F)
+fc_boxplot(res_COG20, res_struc_zeros_COG20, struc_0 = F, keep_failed = F)
+
+```
+
+
+
+
+## Heatmap
+```{r}
+
+ancombc_heatmap <- function(physeq, ancombc_results, disease, color_ramp = NULL, plot_title = NULL, control = "Healthy", fdr_threshold = 0.05, 
+                            fold_change_threshold = log(2), tax_level = "Plasmid_ID", addtitle = "",
+                            legendname = NA, col_fontsize = 7, struc_zeros = NULL, only_struc_zeroes = F, n_struc_zeroes = NULL, 
+                            whatisdifferential = "Plasmids",
+                            ...){
+  
+  temp_taxa_table <- tax_table(physeq) %>% data.frame()
+  temp_metadata <- sample_data(physeq) %>% data.frame()
+  
+  ancombc_results <- ancombc_results  %>% filter(Disease == disease)
+
+  
+  if (!only_struc_zeroes){
+    #relative abundance
+    df <- data.frame(otu_table(physeq)[ancombc_results$taxon[ancombc_results$`q` <= fdr_threshold & 
+                                                               abs(ancombc_results$lfc) >= fold_change_threshold & 
+                                                               ancombc_results$passed_ss == T],])
+    if (!is.null(struc_zeros)){
+      struc_zeros <- struc_zeros %>% rename(sz_disease = paste0("sz_", disease))
+      rownames(struc_zeros) <- struc_zeros$taxon
+      if (is.null(n_struc_zeroes)){
+        # Get the otu information for the structural zero plasmids 
+        zeros_df <- data.frame(otu_table(physeq)[struc_zeros %>% filter(sz_healthy != sz_disease) %>% pull(taxon), colnames(df)])
+      } else {
+        # get a table witht the median of each structural zero plasmid in healthy and disease samples
+        pre_zeros_df <- struc_zeros %>% filter(sz_healthy != sz_disease)
+        pre_zeros_df$median_healthy <- otu_table(physeq)[pre_zeros_df$taxon, temp_metadata[temp_metadata$Disease == control, "SubjectID"]] %>%
+          apply(MARGIN = 1, FUN = median)
+        pre_zeros_df$median_disease <- otu_table(physeq)[pre_zeros_df$taxon, temp_metadata[temp_metadata$Disease == disease, "SubjectID"]] %>%
+          apply(MARGIN = 1, FUN = median)
+        pre_zeros_df$mean_healthy <- otu_table(physeq)[pre_zeros_df$taxon, temp_metadata[temp_metadata$Disease == control, "SubjectID"]] %>%
+          apply(MARGIN = 1, FUN = mean)
+        pre_zeros_df$mean_disease <- otu_table(physeq)[pre_zeros_df$taxon, temp_metadata[temp_metadata$Disease == disease, "SubjectID"]] %>%
+          apply(MARGIN = 1, FUN = mean)
+        pre_zeros_df <- pre_zeros_df %>% mutate(mean_diff = abs(mean_healthy - mean_disease), 
+                                                median_diff = abs(median_healthy - median_disease)) %>% 
+          arrange(desc(median_diff), desc(mean_diff)) %>% 
+          head(n = n_struc_zeroes)
+        zeros_df <- data.frame(otu_table(physeq)[pre_zeros_df$taxon, colnames(df)])
+      }
+      df <- rbind(df, zeros_df)
+    } else {
+      zeros_df <- NULL
+    }
+  } else {
+    struc_zeros <- struc_zeros %>% rename(sz_disease = paste0("sz_", disease))
+    rownames(struc_zeros) <- struc_zeros$taxon
+    if (is.null(n_struc_zeroes)){
+        # Get the otu information for the structural zero plasmids 
+        zeros_df <- data.frame(otu_table(physeq)[struc_zeros %>% filter(sz_healthy != sz_disease) %>% pull(taxon), ])
+    } else {
+        # get a table witht the median of each structural zero plasmid in healthy and disease samples
+        pre_zeros_df <- struc_zeros %>% filter(sz_healthy != sz_disease)
+        pre_zeros_df$median_healthy <- otu_table(physeq)[pre_zeros_df$taxon, temp_metadata[temp_metadata$Disease == control, "SubjectID"]] %>%
+          apply(MARGIN = 1, FUN = median)
+        pre_zeros_df$median_disease <- otu_table(physeq)[pre_zeros_df$taxon, temp_metadata[temp_metadata$Disease == disease, "SubjectID"]] %>%
+          apply(MARGIN = 1, FUN = median)
+        pre_zeros_df$mean_healthy <- otu_table(physeq)[pre_zeros_df$taxon, temp_metadata[temp_metadata$Disease == control, "SubjectID"]] %>%
+          apply(MARGIN = 1, FUN = mean)
+        pre_zeros_df$mean_disease <- otu_table(physeq)[pre_zeros_df$taxon, temp_metadata[temp_metadata$Disease == disease, "SubjectID"]] %>%
+          apply(MARGIN = 1, FUN = mean)
+        pre_zeros_df <- pre_zeros_df %>% mutate(mean_diff = abs(mean_healthy - mean_disease), 
+                                                median_diff = abs(median_healthy - median_disease)) %>% 
+          arrange(desc(median_diff), desc(mean_diff)) %>% 
+          head(n = n_struc_zeroes)
+        zeros_df <- data.frame(otu_table(physeq)[pre_zeros_df$taxon, ])
+    }
+    df <- zeros_df
+  }
+  
+  rownames(df) <- temp_taxa_table[rownames(df), tax_level]  #we use the taxonomy_SGB because with tax_glom it is possible to take different taxonID for same species name
+  
+  # df <- filter_prevalence_abundance_dataframe_no_loop(df, abundance = 0.001, prevalence = 0.1)[1]  %>% as.data.frame()#filter low abundance, 0.1% of abundance in 10% of samples
+  df <- data.frame(t(df))
+  # df <- df[,colSums(df) >= 5] #rm low abundance samples
+  
+  #create the logFC dataframe
+  lfolds <- data.frame(taxon = ancombc_results$taxon, logFC = ancombc_results$lfc)
+  if (!is_null(zeros_df)){
+    zeros_lfolds <- data.frame(taxon = colnames(df)[!colnames(df) %in% lfolds$taxon], 
+                               sz_healthy = struc_zeros[colnames(df)[!colnames(df) %in% lfolds$taxon], "sz_healthy"], 
+                               sz_disease = struc_zeros[colnames(df)[!colnames(df) %in% lfolds$taxon], "sz_disease"]) %>% 
+      mutate(logFC = case_when(sz_disease == T ~ min(lfolds$logFC) - 0.5, sz_disease == F ~ max(lfolds$logFC) + 0.5)) %>%
+      # assign max value + sth for the logFC value of structural zeroes
+      select(taxon, logFC)
+    lfolds <- rbind(lfolds, zeros_lfolds)
+  }
+  rownames(lfolds) <- lfolds$taxon
+  lfolds <- lfolds[colnames(df),]
+  lfolds <- lfolds[order(lfolds$logFC),]
+  df <- df[,rownames(lfolds)]
+  
+  #df <- cbind(Enriched = temp_metadata[rownames(df),]$Enriched, group = temp_metadata[rownames(df),]$group, df)
+  #df <- df[df$group != "CTRL",]
+  df <- cbind(Disease = temp_metadata[rownames(df),]$Disease, df)
+  
+  
+  df <- df[order(df$Disease),]
+  # heatmap(df[,c(-1, -2)] %>% as.matrix(), RowSideColors = df$disease, Rowv = NA)
+  
+  # #col <- list(Enriched = c("Enriched" = "tomato2", "Nonenriched" = "dodgerblue2"), group = c("CTRL" = "blue", "INT" = "red"))
+  # col <- list(Disease = colors[["disease"]])
+  # 
+  # 
+  # ha <- HeatmapAnnotation(
+  #   Disease = df$Disease,
+  #   col = col,
+  #   which = "row"
+  # )
+  # 
+  colmat <- lfolds$logFC
+  # abs_max <- quantile(abs(colmat - 0.5), 0.95, na.rm = TRUE)
+  col_fun_logFC = colorRamp2(c(min(colmat), 0, abs(0.5 + max(colmat))), c("blue4", "white", "red"))
+  
+  logFC_annotation <- HeatmapAnnotation(
+    logFC = lfolds$logFC,
+    col = list( logFC = col_fun_logFC)
+  )
+  
+  if (is_null(plot_title)){
+    plot_title <- paste0(addtitle, disease, " vs. ", control, " (FC >= ", exp(fold_change_threshold) , "): ", ncol(df) - 1, 
+                         " Differentially Abundant ", whatisdifferential)
+  }
+  
+  
+  hm_plot <- Heatmap(as.matrix(df[,c(-1)]),
+          cluster_rows = T,
+          cluster_columns = F,
+          split = df$Disease,
+          row_names_gp = gpar(fontsize = 0),
+          column_names_gp = gpar(fontsize = col_fontsize),
+          clustering_distance_rows = "manhattan",
+          clustering_method_rows = "average",
+          # right_annotation = ha,
+          top_annotation = logFC_annotation,
+          name = legendname, 
+          column_title = plot_title, 
+          column_title_side = "top",
+          column_title_gp = gpar(fontsize = 16),
+          use_raster = F, 
+          #heatmap_legend_param = list(title = "name"),
+          col = color_ramp, 
+          ...
+          )
+
+  return(list(plot = hm_plot, FC = lfolds, profiling = df))  
+}
+```
+
+### Heatmap CD
+```{r}
+
+# cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "CD",
+#                 legendname = "RPKM\nabundance", col_fontsize = 0, 
+#                 color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+# cd_hm$plot
+
+cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "CD",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+cd_hm$plot
+
+
+# cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "CD",
+#                 legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+#                 color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+# cd_hm$plot
+
+cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "CD",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+cd_hm$plot
+
+
+
+# Adding structural zeroes
+# cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "CD",
+#                 legendname = "RPKM\nabundance", col_fontsize = 0, 
+#                 color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+#                 struc_zeros = res_struc_zeros, addtitle = "With struc 0s - ",
+#                 only_struc_zeroes = F, n_struc_zeroes = 100)
+# cd_hm$plot
+
+cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "CD",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+cd_hm$plot
+CD_over <- cd_hm$FC %>% filter(logFC > 0) %>% pull(taxon)
+COG_CD_over <- phylist_plasmids[["annotation"]] %>% filter(Plasmid_ID %in% CD_over, source.y == "COG20_FUNCTION") %>% pull(accession)
+CD_under <- cd_hm$FC %>% filter(logFC < 0) %>% pull(taxon)
+COG_CD_under <- phylist_plasmids[["annotation"]] %>% filter(Plasmid_ID %in% CD_under, source.y == "COG20_FUNCTION") %>% pull(accession)
+
+# cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "CD",
+#                 legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+#                 color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+#                 struc_zeros = res_struc_zeros, addtitle = "With struc 0s - ",
+#                 only_struc_zeroes = F, n_struc_zeroes = 100)
+# cd_hm$plot
+
+cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "CD",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+cd_hm$plot
+
+
+# Only structural zeroes
+
+# cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "CD",
+#                 legendname = "RPKM\nabundance", col_fontsize = 0, 
+#                 color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+#                 struc_zeros = res_struc_zeros, addtitle = "Just struc 0s - ",
+#                 only_struc_zeroes = T, n_struc_zeroes = 200)
+# cd_hm$plot
+
+cd_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "CD",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+cd_hm$plot
+
+```
+
+### Heatmap UC
+```{r}
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+UC_hm$plot
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+UC_hm$plot
+
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+UC_hm$plot
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+UC_hm$plot
+
+
+
+# Adding structural zeroes
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+UC_hm$plot
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+UC_hm$plot
+UC_over <- UC_hm$FC %>% filter(logFC > 0) %>% pull(taxon)
+COG_UC_over <- phylist_plasmids[["annotation"]] %>% filter(Plasmid_ID %in% UC_over, source.y == "COG20_FUNCTION") %>% pull(accession)
+UC_under <- UC_hm$FC %>% filter(logFC < 0) %>% pull(taxon)
+COG_UC_under <- phylist_plasmids[["annotation"]] %>% filter(Plasmid_ID %in% UC_under, source.y == "COG20_FUNCTION") %>% pull(accession)
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+UC_hm$plot
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+UC_hm$plot
+
+
+# Only structural zeroes
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+UC_hm$plot
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+UC_hm$plot
+
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+UC_hm$plot
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm"]], ancombc_results = res_plasmids, disease = "UC",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+UC_hm$plot
+
+
+```
+
+
+
+### Heatmap CD oc
+```{r}
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+
+
+
+# Adding structural zeroes
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+
+
+# Only structural zeroes
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "CD",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+
+
+```
+
+### Heatmap UC oc
+```{r}
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))))
+
+
+
+# Adding structural zeroes
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "With struc 0s - ",
+                only_struc_zeroes = F, n_struc_zeroes = 100)
+
+
+# Only structural zeroes
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "RPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "logRPKM\nabundance", col_fontsize = 0, 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_rpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "RPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(0, 10, 15, 20, 25, 30, 40), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+
+ancombc_heatmap(physeq = phylist_plasmids_only_complete[["phy_logrpkm"]], ancombc_results = res_plasmids_oc, disease = "UC",
+                legendname = "logRPKM\nabundance", fold_change_threshold = log(4), 
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))),
+                struc_zeros = res_struc_zeros_oc, addtitle = "Just struc 0s - ",
+                only_struc_zeroes = T, n_struc_zeroes = 200)
+```
+
+### Systems
+```{r}
+CD_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_systems_rpkm"]], ancombc_results = res_systems, disease = "CD",
+                legendname = "RPKM\nabundance", tax_level = "systems",
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "Plasmid Systems", struc_zeros = res_struc_zeros_systems, only_struc_zeroes = F, n_struc_zeroes = 10)
+CD_hm$plot
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_systems_rpkm"]], ancombc_results = res_systems, disease = "UC",
+                legendname = "RPKM\nabundance", tax_level = "systems",
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "Plasmid Systems", struc_zeros = res_struc_zeros_systems, only_struc_zeroes = F, n_struc_zeroes = 10)
+UC_hm$plot
+
+```
+
+
+
+### System
+```{r}
+CD_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_system_rpkm"]], ancombc_results = res_system, disease = "CD",
+                legendname = "RPKM\nabundance", tax_level = "system",
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "Plasmid Systems", struc_zeros = res_struc_zeros_system, only_struc_zeroes = F, n_struc_zeroes = 10)
+CD_hm$plot
+
+UC_hm <- ancombc_heatmap(physeq = phylist_plasmids[["phy_system_rpkm"]], ancombc_results = res_system, disease = "UC",
+                legendname = "RPKM\nabundance", tax_level = "system",
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "Plasmid Systems", struc_zeros = res_struc_zeros_system, only_struc_zeroes = F, n_struc_zeroes = 10)
+UC_hm$plot
+
+```
+
+
+### Relaxase
+```{r}
+phylist_plasmids[["phy_relaxase_rpkm"]]@tax_table[,"relaxase_type.s."] <- gsub(pattern = ",", replacement = "_", 
+                                            x = phylist_plasmids[["phy_relaxase_rpkm"]]@tax_table[,"relaxase_type.s."])
+rownames(phylist_plasmids[["phy_relaxase_rpkm"]]@tax_table) <- gsub(pattern = ",", replacement = "_",
+                                                                x = rownames(phylist_plasmids[["phy_relaxase_rpkm"]]@tax_table))
+rownames(phylist_plasmids[["phy_relaxase_rpkm"]]@otu_table) <- gsub(pattern = ",", replacement = "_",
+                                                                x = rownames(phylist_plasmids[["phy_relaxase_rpkm"]]@otu_table))
+res_relaxase$taxon <- gsub(pattern = ",", replacement = "_",res_relaxase$taxon)
+res_struc_zeros_relaxase$taxon <- gsub(pattern = ",", replacement = "_",res_struc_zeros_relaxase$taxon)
+
+CD_rel <- ancombc_heatmap(physeq = phylist_plasmids[["phy_relaxase_rpkm"]], ancombc_results = res_relaxase, disease = "CD",
+                legendname = "RPKM\nabundance", tax_level = "relaxase_type.s.",
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "Relaxase", struc_zeros = res_struc_zeros_relaxase, only_struc_zeroes = F, n_struc_zeroes = 10)
+CD_rel$plot
+
+UC_rel <- ancombc_heatmap(physeq = phylist_plasmids[["phy_relaxase_rpkm"]], ancombc_results = res_relaxase, disease = "UC",
+                legendname = "RPKM\nabundance", tax_level = "relaxase_type.s.",
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "Relaxase", struc_zeros = res_struc_zeros_relaxase, only_struc_zeroes = F, n_struc_zeroes = 10)
+UC_rel$plot
+
+```
+
+### Genes
+
+#### COGs
+```{r}
+CD_genes <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm_COG20"]], ancombc_results = res_COG20, disease = "CD",
+                legendname = "RPKM\nabundance", tax_level = "accession",
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "COGs")
+                #whatisdifferential = "COGs", struc_zeros = res_struc_zeros_COG20, only_struc_zeroes = F, n_struc_zeroes = 10)
+CD_genes$plot
+
+UC_genes <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm_COG20"]], ancombc_results = res_COG20, disease = "UC",
+                legendname = "RPKM\nabundance", tax_level = "accession",
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "COGs")
+                #whatisdifferential = "COGs", struc_zeros = res_struc_zeros_COG20, only_struc_zeroes = F, n_struc_zeroes = 10)
+UC_genes$plot
+
+CD_genes <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm_COG20"]], ancombc_results = res_COG20, disease = "CD",
+                legendname = "logRPKM\nabundance", tax_level = "accession",
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))), 
+                whatisdifferential = "COGs")
+                #whatisdifferential = "COGs", struc_zeros = res_struc_zeros_COG20, only_struc_zeroes = F, n_struc_zeroes = 10)
+CD_genes$plot
+
+UC_genes <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm_COG20"]], ancombc_results = res_COG20, disease = "UC",
+                legendname = "logRPKM\nabundance", tax_level = "accession",
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))), 
+                whatisdifferential = "COGs")
+                #whatisdifferential = "COGs", struc_zeros = res_struc_zeros_COG20, only_struc_zeroes = F, n_struc_zeroes = 10)
+UC_genes$plot
+
+
+# Extract significant gene orthologs
+COG_CD_over <- CD_genes$FC %>% filter(logFC > 0) %>% pull(taxon)
+COG_CD_under <- CD_genes$FC %>% filter(logFC < 0) %>% pull(taxon)
+
+COG_UC_over <- UC_genes$FC %>% filter(logFC > 0) %>% pull(taxon)
+COG_UC_under <- UC_genes$FC %>% filter(logFC < 0) %>% pull(taxon)
+
+```
+
+#### Pfams
+```{r}
+CD_genes <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm_pfam"]], ancombc_results = res_pfam, disease = "CD",
+                legendname = "RPKM\nabundance", tax_level = "accession", fold_change_threshold = log(4),
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "Pfams")
+#                whatisdifferential = "Pfams", struc_zeros = res_struc_zeros_pfam, only_struc_zeroes = F, n_struc_zeroes = 10)
+CD_genes$plot
+
+UC_genes <- ancombc_heatmap(physeq = phylist_plasmids[["phy_rpkm_pfam"]], ancombc_results = res_pfam, disease = "UC",
+                legendname = "RPKM\nabundance", tax_level = "accession", fold_change_threshold = log(4),
+                color_ramp = colorRamp2(c(0, 5, 10, 15, 20, 25, 30, 40, 50), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(8))), 
+                whatisdifferential = "Pfams")
+#                whatisdifferential = "Pfams", struc_zeros = res_struc_zeros_pfam, only_struc_zeroes = F, n_struc_zeroes = 10)
+UC_genes$plot
+
+CD_genes <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm_pfam"]], ancombc_results = res_pfam, disease = "CD",
+                legendname = "logRPKM\nabundance", tax_level = "accession",
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))), 
+                whatisdifferential = "Pfams")
+#                whatisdifferential = "Pfams", struc_zeros = res_struc_zeros_pfam, only_struc_zeroes = F, n_struc_zeroes = 10)
+CD_genes$plot
+
+UC_genes <- ancombc_heatmap(physeq = phylist_plasmids[["phy_logrpkm_pfam"]], ancombc_results = res_pfam, disease = "UC",
+                legendname = "logRPKM\nabundance", tax_level = "accession",
+                color_ramp = colorRamp2(c(-7, -5, -2, 0, 2, 5, 7), c("black", viridis_pal(begin = 0, end = 1, direction = 1)(6))), 
+                whatisdifferential = "Pfams")
+#                whatisdifferential = "Pfams", struc_zeros = res_struc_zeros_pfam, only_struc_zeroes = F, n_struc_zeroes = 10)
+UC_genes$plot
+
+
+# Extract significant gene orthologs
+pfam_CD_over <- CD_genes$FC %>% filter(logFC > 0) %>% pull(taxon)
+pfam_CD_under <- CD_genes$FC %>% filter(logFC < 0) %>% pull(taxon)
+
+pfam_UC_over <- UC_genes$FC %>% filter(logFC > 0) %>% pull(taxon)
+pfam_UC_under <- UC_genes$FC %>% filter(logFC < 0) %>% pull(taxon)
+
+```
+
+
+## COG Enrichment
+
+### CD 
+```{r}
+#phylist_plasmids[["phy_count_COG20"]]@tax_table[COG_CD_over,"function."]
+
+
+COG_category_CD_over <- enrichCOG(
+  COG_CD_over,
+  dtype = "category", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result %>% mutate(Disease = "CD", type = "category", expression = "over")
+ 
+
+COG_category_CD_under <- enrichCOG(
+  COG_CD_under,
+  dtype = "category", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result %>% mutate(Disease = "CD", type = "category", expression = "under")
+
+COG_pathway_CD_over <- enrichCOG(
+  COG_CD_over,
+  dtype = "pathway", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result %>% mutate(Disease = "CD", type = "pathway", expression = "over")
+
+COG_pathway_CD_under <- enrichCOG(
+  COG_CD_under,
+  dtype = "pathway", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result %>% mutate(Disease = "CD", type = "pathway", expression = "under")
+
+```
+
+### UC
+
+```{r}
+COG_category_UC_over <- enrichCOG(
+  COG_UC_over,
+  dtype = "category", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result %>% mutate(Disease = "UC", type = "category", expression = "over")
+
+COG_category_UC_under <- enrichCOG(
+  COG_UC_under,
+  dtype = "category", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result %>% mutate(Disease = "UC", type = "category", expression = "under")
+
+COG_pathway_UC_over <- enrichCOG(
+  COG_UC_over,
+  dtype = "pathway", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result %>% mutate(Disease = "UC", type = "pathway", expression = "over")
+
+COG_pathway_UC_under <- enrichCOG(
+  COG_UC_under,
+  dtype = "pathway", pvalueCutoff = 0.05, pAdjustMethod = "BH", qvalueCutoff = 0.05, 
+  #universe = phylist_plasmids[["annotation"]] %>% filter(source.y == "COG20_FUNCTION") %>% pull(accession) %>% unique()
+)@result %>% mutate(Disease = "UC", type = "pathway", expression = "under")
+
+```
+
+
+### Join
+```{r}
+COG_enrichment <- rbind(COG_category_CD_over, COG_category_CD_under, COG_pathway_CD_over, COG_pathway_CD_under,
+                        COG_category_UC_over, COG_category_UC_under, COG_pathway_UC_over, COG_pathway_UC_under) %>% 
+  filter(qvalue < 0.05)
+
+ggplot(COG_enrichment, mapping = aes(x = Disease, y = Description, color = expression, size = FoldEnrichment)) +
+    geom_point() + theme_minimal()
+```
+

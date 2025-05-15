@@ -1,0 +1,118 @@
+# Libraries
+```{r}
+library(plyr)
+library(tidyverse)
+library(pheatmap)
+library(ggplot2)
+library(ape)
+library(ComplexHeatmap)
+library(circlize)
+library(edgeR)
+library(readxl)
+library(umap)
+library(ecodist)
+library(rnndescent)
+library(uwot)
+library(phyloseq)
+library(scales)
+library(randomcoloR)
+library(magrittr)
+library(cowplot)
+library(gridExtra)
+library(viridis)
+library(ANCOMBC)
+library(MicrobiomeProfiler)
+library(ggrepel)
+library(e1071)
+source("BASE_DIR/SCRIPTS/omics_analyses_functions.R")
+source("BASE_DIR/SCRIPTS/PLASMIDOME/plasmidome_analysis_functions.R")
+source("BASE_DIR/SCRIPTS/diversity.R")
+```
+
+
+# Load phyloseq
+```{r}
+load(file = "BASE_DIR/PROFILING/phyloseq_complete.RData")
+
+phylist_plasmids[["phy_count"]] <- phylist_plasmids[["phy_count"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_rpkm"]] <- phylist_plasmids[["phy_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_logrpkm"]] <- phylist_plasmids[["phy_logrpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_system_rpkm"]] <- phylist_plasmids[["phy_system_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_systems_rpkm"]] <- phylist_plasmids[["phy_systems_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_rep_rpkm"]] <- phylist_plasmids[["phy_rep_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_relaxase_rpkm"]] <- phylist_plasmids[["phy_relaxase_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_mpf_rpkm"]] <- phylist_plasmids[["phy_mpf_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_orit_rpkm"]] <- phylist_plasmids[["phy_orit_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_mobility_rpkm"]] <- phylist_plasmids[["phy_mobility_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_cluster_type_rpkm"]] <- phylist_plasmids[["phy_cluster_type_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_circularity_rpkm"]] <- phylist_plasmids[["phy_circularity_rpkm"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_AMR"]] <- phylist_plasmids[["phy_AMR"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_rpkm_COG20"]] <- phylist_plasmids[["phy_rpkm_COG20"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+phylist_plasmids[["phy_rpkm_pfam"]] <- phylist_plasmids[["phy_rpkm_pfam"]] %>% subset_samples(Study == "Longitudinal Mycobiome")
+
+# Also filter out plasmids with no prevalence
+filt_plasmids <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_count"]]@otu_table), abundance = 0.001,
+                                                               prevalence = 0)[[2]]
+filt_systems <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_systems_rpkm"]]@otu_table), abundance = 0.001,
+                                                               prevalence = 0)[[2]]
+filt_COG <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_rpkm_COG20"]]@otu_table), abundance = 0.001,
+                                                               prevalence = 0)[[2]]
+filt_pfam <- filter_prevalence_abundance_dataframe_no_loop(data.frame(phylist_plasmids[["phy_rpkm_pfam"]]@otu_table), abundance = 0.001,
+                                                               prevalence = 0)[[2]]
+phylist_plasmids[["phy_count"]] <- phylist_plasmids[["phy_count"]] %>% subset_taxa(!Plasmid_ID %in% filt_plasmids)
+phylist_plasmids[["phy_rpkm"]] <- phylist_plasmids[["phy_rpkm"]] %>% subset_taxa(!Plasmid_ID %in% filt_plasmids)
+phylist_plasmids[["phy_logrpkm"]] <- phylist_plasmids[["phy_logrpkm"]] %>% subset_taxa(!Plasmid_ID %in% filt_plasmids)
+phylist_plasmids[["phy_systems_rpkm"]] <- phylist_plasmids[["phy_systems_rpkm"]] %>% subset_taxa(!systems %in% filt_systems)
+phylist_plasmids[["phy_rpkm_COG20"]] <- phylist_plasmids[["phy_rpkm_COG20"]] %>% subset_taxa(!accession %in% filt_COG)
+phylist_plasmids[["phy_rpkm_pfam"]] <- phylist_plasmids[["phy_rpkm_pfam"]] %>% subset_taxa(!accession %in% filt_pfam)
+
+
+# Recalculate distance matrices with Bray-Curtis
+phylist_plasmids[["dist"]] <- bcdist(as.matrix(data.frame(otu_table(phylist_plasmids[["phy_rpkm"]]))) %>% t())
+phylist_plasmids[["dist_tree"]] <- hclust(phylist_plasmids[["dist"]], method = "complete")
+
+# phylist_plasmids_with_fragments[["dist"]] <- bcdist(as.matrix(data.frame(otu_table(phylist_plasmids_with_fragments[["phy_rpkm"]]))) %>% t())
+# phylist_plasmids_with_fragments[["dist_tree"]] <- hclust(phylist_plasmids_with_fragments[["dist"]], method = "complete")
+
+phylist_plasmids[["phy_rpkm"]]@sam_data$Subject <- unlist(strsplit(phylist_plasmids[["phy_rpkm"]]@sam_data$SubjectID, split = "\\_.C", fixed = F))
+phylist_plasmids[["phy_rpkm"]]@sam_data$Timepoint <- sub(".*_(\\d+)C", "\\1", phylist_plasmids[["phy_rpkm"]]@sam_data$SubjectID)
+
+phylist_plasmids[["phy_logrpkm"]]@sam_data$Subject <- unlist(strsplit(phylist_plasmids[["phy_rpkm"]]@sam_data$SubjectID, split = "\\_.C", fixed = F))
+phylist_plasmids[["phy_logrpkm"]]@sam_data$Timepoint <- sub(".*_(\\d+)C", "\\1", phylist_plasmids[["phy_rpkm"]]@sam_data$SubjectID)
+
+save(phylist_plasmids, colors, rename_plasmid_systems,
+     file = "BASE_DIR/longitudinal_phyloseq.Rmd")
+
+```
+
+## Load info 
+
+```{r}
+load(file = "BASE_DIR/longitudinal_phyloseq.Rmd")
+```
+
+
+
+# Rel abundance plot
+```{r}
+plot_taxa_abundances_rel(phy_obj = phylist_plasmids[["phy_rpkm"]], facet_condition = "Subject", top_func = sum,
+                     taxonomic_rank = "Plasmid_ID", plotlegend = F, n = 15000, tax_glom_done = T, palette = rep(colors$general_palette, 15000/length(colors$general_palette))) + 
+  guides(fill = guide_legend(ncol = 1)) 
+```
+
+
+# Heatmap
+```{r}
+
+heatmap_rpkm <- plot_rpkm_heatmap_longitudinal(phy = phylist_plasmids$phy_logrpkm, cluster_rows = F, 
+                  rowside_vars = c("Subject"), 
+                  rowside_cols = list("Subject" = colors$general_palette[c(2,4,7,9,11,13)]) ,
+                  # colside_vars = c("Circularity"),
+                  # colside_cols = list(Circularity = colors$circularity),
+                  row_title = paste0(nrow(sample_data(phylist_plasmids$phy_logrpkm)), " samples"), 
+                  col_title = paste0(nrow(tax_table(phylist_plasmids$phy_logrpkm)), " plasmids"), row_dend_width = 0.1
+                  )
+
+heatmap_rpkm
+```
+

@@ -1,0 +1,104 @@
+```{r}
+library(readxl)
+library(phyloseq)
+library(tidyverse)
+library(microbiomeMarker)
+library(ggpubr)
+
+```
+
+Compare sequencing stats between studies
+```{r}
+enriched_length <- read.table(file = '/mnt/synology/RAW_DATA/POP_STUDY/POPULATION_STUDY_7TH_BATCH_MAY_24/seq_stats_7th_batch.tsv', sep = '\t', header = T) 
+nonenriched_length <- read.table(file = '/mnt/synology/RAW_DATA/POP_STUDY/sequencing_stats_feb_24.tsv', sep = '\t', header = T) 
+
+enriched_length$Sample_ID <- gsub(x = enriched_length$Sample_ID, pattern = 'F$', replacement = '')
+
+enriched_length$Sample_ID[enriched_length$Sample_ID %in% c("HCPOP_00106", "HCPOP_00105")] <- 
+  gsub(x = enriched_length$Sample_ID[enriched_length$Sample_ID %in%
+          c("HCPOP_00106", "HCPOP_00105")], pattern = '00', replacement = '0', fixed = TRUE)
+
+IBD_samples <- read.table('BASE_DIR/KNEAD_DATA_METAHIT/metahit_dna_joined_seqstats.tsv',
+                          header = T, sep = '\t')
+
+longitudinal_samples <- read.table('/mnt/synology/ZIXUAN/LongitudinalMycobiome/merged_qc_summary.csv',
+                          header = T, sep = ',') %>% mutate(avg_length = NA) %>%
+  select(Sample_ID = SampleID, avg_length, n_reads = Raw.reads)
+
+sample_stats <- rbind(nonenriched_length %>% mutate(Study = 'POP'),
+                      enriched_length %>% mutate(Study = 'POP enriched'), 
+                      IBD_samples %>% mutate(Study = 'Metahit'),
+                      longitudinal_samples %>% mutate(Study = 'Longitudinal Mycobiome')) %>%
+  mutate(Gb = avg_length * n_reads / 1000000000, Article = 'Manichanh Lab')
+
+```
+
+Sequencing stats of other human metagenomes
+```{r}
+Conteville_studies <- rbind(
+  read.csv('BASE_DIR/OTHER_METAGENOMES_STATS/PRJNA268964.csv', header = T),
+  read.csv('BASE_DIR/OTHER_METAGENOMES_STATS/PRJNA278393.csv', header = T),
+  read.csv('BASE_DIR/OTHER_METAGENOMES_STATS/PRJNA527208.csv', header = T)) %>%
+  select(Sample_ID = Sample.Accession, Study = Study.Accession, n_reads = Total.Spots, 
+         b = Total.Bases) %>%
+  mutate(Gb = b/1000000000, Article = 'Conteville et al', avg_length = b/n_reads ) %>%
+  select(-b)
+
+Yu_studies <- rbind(
+  read.csv('BASE_DIR/OTHER_METAGENOMES_STATS/PRJEB7774.csv', header = T),
+  read.csv('BASE_DIR/OTHER_METAGENOMES_STATS/PRJEB6092.csv', header = T),
+  read.csv('BASE_DIR/OTHER_METAGENOMES_STATS/Yu_et_al.csv', header = T)
+) %>% select(Sample_ID = Sample.Accession, Study = Study.Accession, n_reads = Total.Spots, 
+         b = Total.Bases) %>%
+  mutate(Gb = b/1000000000, Article = 'Yu et al', avg_length = b/n_reads ) %>%
+  select(-b)
+
+Lai_studies <- read.csv('BASE_DIR/OTHER_METAGENOMES_STATS/Lai_et_al.csv',
+                        header = T) %>%
+  select(Sample_ID = Sample.Accession, Study = Study.Accession, n_reads = Total.Spots, 
+         b = Total.Bases) %>%
+  mutate(Gb = b/1000000000, Article = 'Lai et al', avg_length = b/n_reads ) %>%
+  select(-b)
+
+Yang_studies <- read_xlsx('BASE_DIR/OTHER_METAGENOMES_STATS/Li_et_al.xlsx', 
+                          skip = 1) %>% select(Sample_ID = `Sample ID`,
+                                               avg_length = `Avg read length`,
+                                               n_reads = `Total Reads Number`,
+                                               Gb = `Total Base pairs`) %>% 
+  filter(!is.na(Sample_ID)) %>%
+  mutate( Study = 'Li et al.', Article = 'Yang et al.', Gb = as.numeric(Gb)/1000000000)
+
+Zorea_studies <- read.csv('BASE_DIR/OTHER_METAGENOMES_STATS/Zorea_et_al.csv',
+                        header = T) %>%
+  select(Sample_ID = Sample.Accession, Study = Study.Accession, n_reads = Total.Spots, 
+         b = Total.Bases) %>%
+  mutate(Gb = b/1000000000, Article = 'Zorea et al', avg_length = b/n_reads ) %>%
+  select(-b)
+
+other_studies <- rbind(Conteville_studies, Yu_studies, Lai_studies, Yang_studies, Zorea_studies) %>%
+  mutate(Gb = as.numeric(Gb), n_reads= as.numeric(n_reads)) %>% filter(!is.na(Gb))
+```
+
+
+Comparing our sequencing stats
+```{r}
+ggplot(data = sample_stats, mapping = aes(x = Study, y = Gb, fill = Study)) + 
+  geom_boxplot() + theme_minimal()
+
+ggplot(data = sample_stats, mapping = aes(x = Study, y = n_reads, fill = Study)) + 
+  geom_boxplot() + theme_minimal()
+```
+
+
+Comparing all sequencing stats
+```{r}
+all_stats <- rbind(sample_stats, other_studies)
+
+ggplot(data = all_stats, mapping = aes(x = Article, y = Gb, fill = Article)) + 
+  geom_boxplot() + theme_minimal() + ylim(c(0, 50))
+
+ggplot(data = all_stats, mapping = aes(x = Article, y = n_reads, fill = Article)) + 
+  geom_boxplot() + theme_minimal()
+```
+
+
